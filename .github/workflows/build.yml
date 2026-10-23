@@ -7,7 +7,7 @@ permissions:
   contents: write
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
       - name: Create project files
@@ -43,12 +43,13 @@ jobs:
                   UILaunchScreen: {}
                   LSApplicationQueriesSchemes: [whatsapp]
                   UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+                  NSPhotoLibraryUsageDescription: Pick photos and videos to make stickers
               settings:
                 base:
                   PRODUCT_BUNDLE_IDENTIFIER: com.stickify.app
                   SWIFT_VERSION: "5.0"
-                  MARKETING_VERSION: "1.1"
-                  CURRENT_PROJECT_VERSION: "2"
+                  MARKETING_VERSION: "1.2"
+                  CURRENT_PROJECT_VERSION: "3"
                   TARGETED_DEVICE_FAMILY: "1"
                   ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
           EOF_FILE
@@ -98,7 +99,49 @@ jobs:
 
           enum Palette {
               static let colors: [Color] = [.green, .blue, .purple, .pink, .orange, .teal]
+              static var current: Color {
+                  colors[min(UserDefaults.standard.integer(forKey: "accent"), colors.count - 1)]
+              }
           }
+
+          // MARK: - Liquid Glass (iOS 26+) مع بديل شفاف للإصدارات الأقدم
+
+          func glassed<V: View, S: Shape>(_ v: V, _ shape: S, tint: Color?) -> AnyView {
+              #if compiler(>=6.2)
+              if #available(iOS 26.0, *) {
+                  if let tint {
+                      return AnyView(v.glassEffect(.regular.tint(tint.opacity(0.7)), in: shape))
+                  }
+                  return AnyView(v.glassEffect(.regular, in: shape))
+              }
+              #endif
+              if let tint {
+                  return AnyView(v.background(.ultraThinMaterial, in: shape).background(tint.opacity(0.5), in: shape))
+              }
+              return AnyView(v.background(.ultraThinMaterial, in: shape))
+          }
+
+          extension View {
+              func panel<S: Shape>(_ shape: S, tint: Color? = nil) -> AnyView {
+                  if UserDefaults.standard.bool(forKey: "glass") { return glassed(self, shape, tint: tint) }
+                  return AnyView(self.background(tint ?? Color.gray.opacity(0.15), in: shape))
+              }
+
+              func appBackdrop() -> AnyView {
+                  if UserDefaults.standard.bool(forKey: "glass") {
+                      return AnyView(
+                          self.scrollContentBackground(.hidden)
+                              .background(
+                                  LinearGradient(colors: [Palette.current.opacity(0.4), Palette.current.opacity(0.08)],
+                                                 startPoint: .top, endPoint: .bottom).ignoresSafeArea()
+                              )
+                      )
+                  }
+                  return AnyView(self)
+              }
+          }
+
+          // MARK: - Models
 
           struct StickerMeta: Codable, Identifiable, Hashable {
               var id: String
@@ -115,7 +158,7 @@ jobs:
 
           final class Library: ObservableObject {
               @Published var packs: [PackMeta] = []
-              private let root: URL
+              let root: URL
               private let cache = NSCache<NSString, UIImage>()
 
               init() {
@@ -126,15 +169,20 @@ jobs:
                      let p = try? JSONDecoder().decode([PackMeta].self, from: data) { packs = p }
               }
 
-              private func persist() {
+              func persist() {
                   if let d = try? JSONEncoder().encode(packs) {
                       try? d.write(to: root.appendingPathComponent("packs.json"))
                   }
               }
 
-              private func url(_ sid: String) -> URL { root.appendingPathComponent(sid + ".webp") }
+              func url(_ sid: String) -> URL { root.appendingPathComponent(sid + ".webp") }
 
               func data(_ sid: String) -> Data? { try? Data(contentsOf: url(sid)) }
+
+              func writeSticker(_ sid: String, _ data: Data) {
+                  try? data.write(to: url(sid))
+                  cache.removeObject(forKey: sid as NSString)
+              }
 
               func thumb(_ sid: String) -> UIImage {
                   if let c = cache.object(forKey: sid as NSString) { return c }
@@ -165,10 +213,16 @@ jobs:
                   persist()
               }
 
+              func deleteAll() {
+                  for p in packs { for s in p.stickers { try? FileManager.default.removeItem(at: url(s.id)) } }
+                  packs = []
+                  persist()
+              }
+
               func addSticker(_ packID: String, data: Data, emojis: [String]) {
                   guard let i = packs.firstIndex(where: { $0.id == packID }) else { return }
                   let sid = UUID().uuidString
-                  try? data.write(to: url(sid))
+                  writeSticker(sid, data)
                   packs[i].stickers.append(StickerMeta(id: sid, emojis: emojis))
                   persist()
               }
@@ -187,6 +241,8 @@ jobs:
                   persist()
               }
           }
+
+          // MARK: - WhatsApp
 
           enum WhatsApp {
               static func send(_ pack: PackMeta, lib: Library) -> String? {
@@ -207,7 +263,7 @@ jobs:
                   var items: [[String: Any]] = []
                   for s in list {
                       guard let d = lib.data(s.id) else { continue }
-                      let em = s.emojis.isEmpty ? ["😀"] : Array(s.emojis.prefix(3))
+                      let em = s.emojis.isEmpty ? ["😀"] : [s.emojis[0]]
                       items.append(["image_data": d.base64EncodedString(), "emojis": em])
                   }
                   let json: [String: Any] = [
@@ -216,6 +272,7 @@ jobs:
                       "publisher": pack.publisher,
                       "tray_image": trayPNG.base64EncodedString(),
                       "is_animated_sticker_pack": pack.animated,
+                      "animated_sticker_pack": pack.animated,
                       "stickers": items
                   ]
                   guard let data = try? JSONSerialization.data(withJSONObject: json) else {
@@ -236,19 +293,180 @@ jobs:
               @AppStorage("lang") private var lang = "ar"
               @AppStorage("theme") private var theme = 0
               @AppStorage("accent") private var accent = 0
+              @AppStorage("glass") private var glass = false
 
               init() { SDImageCodersManager.shared.addCoder(SDImageWebPCoder.shared) }
 
               var body: some Scene {
                   WindowGroup {
                       HomeView()
-                          .id(lang)
+                          .id("\(lang)-\(glass)-\(accent)")
                           .environmentObject(lib)
                           .environment(\.layoutDirection, lang == "ar" ? .rightToLeft : .leftToRight)
                           .tint(Palette.colors[min(accent, Palette.colors.count - 1)])
                           .preferredColorScheme(theme == 1 ? .light : (theme == 2 ? .dark : nil))
                   }
               }
+          }
+          EOF_FILE
+          cat > Sources/Backup.swift <<'EOF_FILE'
+          import SwiftUI
+          import UIKit
+          import Compression
+
+          // قارئ وكاتب ZIP بسيط (الكتابة بدون ضغط لأن WebP مضغوط أصلاً، والقراءة تدعم stored و deflate)
+          enum Zip {
+              static let crcTable: [UInt32] = (0..<256).map { i -> UInt32 in
+                  var c = UInt32(i)
+                  for _ in 0..<8 { c = (c & 1) != 0 ? (0xEDB88320 ^ (c >> 1)) : (c >> 1) }
+                  return c
+              }
+
+              static func crc32(_ data: Data) -> UInt32 {
+                  var c: UInt32 = 0xFFFFFFFF
+                  for b in data { c = crcTable[Int((c ^ UInt32(b)) & 0xFF)] ^ (c >> 8) }
+                  return c ^ 0xFFFFFFFF
+              }
+
+              static func write(entries: [(name: String, data: Data)]) -> Data {
+                  var out = Data()
+                  var central = Data()
+                  for e in entries {
+                      let name = Data(e.name.utf8)
+                      let crc = crc32(e.data)
+                      let offset = UInt32(out.count)
+                      let size = UInt32(e.data.count)
+                      out.le32(0x04034b50); out.le16(20); out.le16(0x0800); out.le16(0)
+                      out.le16(0); out.le16(0x21)
+                      out.le32(crc); out.le32(size); out.le32(size)
+                      out.le16(UInt16(name.count)); out.le16(0)
+                      out.append(name); out.append(e.data)
+                      central.le32(0x02014b50); central.le16(20); central.le16(20); central.le16(0x0800); central.le16(0)
+                      central.le16(0); central.le16(0x21)
+                      central.le32(crc); central.le32(size); central.le32(size)
+                      central.le16(UInt16(name.count)); central.le16(0); central.le16(0); central.le16(0); central.le16(0)
+                      central.le32(0); central.le32(offset)
+                      central.append(name)
+                  }
+                  let cdOffset = UInt32(out.count)
+                  out.append(central)
+                  out.le32(0x06054b50); out.le16(0); out.le16(0)
+                  out.le16(UInt16(entries.count)); out.le16(UInt16(entries.count))
+                  out.le32(UInt32(central.count)); out.le32(cdOffset); out.le16(0)
+                  return out
+              }
+
+              static func read(_ d: Data) -> [String: Data]? {
+                  let bytes = [UInt8](d)
+                  func u16(_ o: Int) -> Int { Int(bytes[o]) | (Int(bytes[o + 1]) << 8) }
+                  func u32(_ o: Int) -> Int { u16(o) | (u16(o + 2) << 16) }
+                  guard bytes.count >= 22 else { return nil }
+                  var eocd = -1
+                  var i = bytes.count - 22
+                  let lowest = max(0, bytes.count - 22 - 65535)
+                  while i >= lowest {
+                      if u32(i) == 0x06054b50 { eocd = i; break }
+                      i -= 1
+                  }
+                  guard eocd >= 0 else { return nil }
+                  let count = u16(eocd + 10)
+                  var p = u32(eocd + 16)
+                  var result: [String: Data] = [:]
+                  for _ in 0..<count {
+                      guard p + 46 <= bytes.count, u32(p) == 0x02014b50 else { return nil }
+                      let method = u16(p + 10)
+                      let csize = u32(p + 20)
+                      let usize = u32(p + 24)
+                      let nlen = u16(p + 28), elen = u16(p + 30), clen = u16(p + 32)
+                      let lho = u32(p + 42)
+                      guard p + 46 + nlen <= bytes.count else { return nil }
+                      let name = String(decoding: bytes[(p + 46)..<(p + 46 + nlen)], as: UTF8.self)
+                      p += 46 + nlen + elen + clen
+                      guard lho + 30 <= bytes.count else { return nil }
+                      let ds = lho + 30 + u16(lho + 26) + u16(lho + 28)
+                      guard ds + csize <= bytes.count else { return nil }
+                      let comp = Data(bytes[ds..<(ds + csize)])
+                      if method == 0 {
+                          result[name] = comp
+                      } else if method == 8 {
+                          guard let inflated = inflate(comp, usize) else { return nil }
+                          result[name] = inflated
+                      } else { return nil }
+                  }
+                  return result
+              }
+
+              static func inflate(_ d: Data, _ size: Int) -> Data? {
+                  if size == 0 { return Data() }
+                  var out = Data(count: size)
+                  let n = out.withUnsafeMutableBytes { (dst: UnsafeMutableRawBufferPointer) -> Int in
+                      d.withUnsafeBytes { (src: UnsafeRawBufferPointer) -> Int in
+                          compression_decode_buffer(
+                              dst.bindMemory(to: UInt8.self).baseAddress!, size,
+                              src.bindMemory(to: UInt8.self).baseAddress!, d.count,
+                              nil, COMPRESSION_ZLIB)
+                      }
+                  }
+                  return n == size ? out : nil
+              }
+          }
+
+          extension Data {
+              mutating func le16(_ v: UInt16) {
+                  append(UInt8(v & 0xFF)); append(UInt8(v >> 8))
+              }
+              mutating func le32(_ v: UInt32) {
+                  for i in 0..<4 { append(UInt8((v >> (8 * UInt32(i))) & 0xFF)) }
+              }
+          }
+
+          extension Library {
+              /// نسخة احتياطية لكل الحزم في ملف ZIP واحد
+              func makeBackup() -> URL? {
+                  guard let idx = try? JSONEncoder().encode(packs) else { return nil }
+                  var entries: [(name: String, data: Data)] = [("packs.json", idx)]
+                  for p in packs {
+                      for s in p.stickers {
+                          if let d = data(s.id) { entries.append((s.id + ".webp", d)) }
+                      }
+                  }
+                  let zip = Zip.write(entries: entries)
+                  let f = DateFormatter()
+                  f.dateFormat = "yyyy-MM-dd"
+                  let url = FileManager.default.temporaryDirectory.appendingPathComponent("Stickify-backup-\(f.string(from: Date())).zip")
+                  do { try zip.write(to: url); return url } catch { return nil }
+              }
+
+              /// استرجاع: يضيف الحزم الجديدة ويستبدل اللي لها نفس المعرّف. يرجع عدد الحزم أو nil لو الملف غير صالح
+              func restore(_ zip: Data) -> Int? {
+                  guard let files = Zip.read(zip),
+                        let idx = files["packs.json"],
+                        let incoming = try? JSONDecoder().decode([PackMeta].self, from: idx) else { return nil }
+                  var n = 0
+                  for var p in incoming {
+                      p.stickers = p.stickers.filter { files[$0.id + ".webp"] != nil }
+                      for s in p.stickers {
+                          if let d = files[s.id + ".webp"] { writeSticker(s.id, d) }
+                      }
+                      if let i = packs.firstIndex(where: { $0.id == p.id }) { packs[i] = p } else { packs.append(p) }
+                      n += 1
+                  }
+                  persist()
+                  return n
+              }
+          }
+
+          struct ShareItem: Identifiable {
+              let id = UUID()
+              let url: URL
+          }
+
+          struct ShareSheet: UIViewControllerRepresentable {
+              let url: URL
+              func makeUIViewController(context: Context) -> UIActivityViewController {
+                  UIActivityViewController(activityItems: [url], applicationActivities: nil)
+              }
+              func updateUIViewController(_ vc: UIActivityViewController, context: Context) {}
           }
           EOF_FILE
           cat > Sources/Imaging.swift <<'EOF_FILE'
@@ -302,7 +520,69 @@ jobs:
               }
           }
 
+          /// فحص بنية ملف WebP حسب شروط واتساب
+          enum WebPInfo {
+              struct Report {
+                  var width = 0
+                  var height = 0
+                  var animated = false
+                  var frames = 0
+                  var minDur = Int.max
+                  var totalMs = 0
+              }
+
+              static func inspect(_ d: Data) -> Report? {
+                  let b = [UInt8](d)
+                  guard b.count > 20,
+                        String(decoding: b[0..<4], as: UTF8.self) == "RIFF",
+                        String(decoding: b[8..<12], as: UTF8.self) == "WEBP" else { return nil }
+                  func le(_ o: Int, _ n: Int) -> Int {
+                      var v = 0
+                      for i in 0..<n { v |= Int(b[o + i]) << (8 * i) }
+                      return v
+                  }
+                  var r = Report()
+                  var p = 12
+                  while p + 8 <= b.count {
+                      let tag = String(decoding: b[p..<(p + 4)], as: UTF8.self)
+                      let size = le(p + 4, 4)
+                      let body = p + 8
+                      if tag == "VP8X", body + 10 <= b.count {
+                          r.animated = (b[body] & 0x02) != 0
+                          r.width = le(body + 4, 3) + 1
+                          r.height = le(body + 7, 3) + 1
+                      } else if tag == "ANMF", body + 16 <= b.count {
+                          r.frames += 1
+                          let dur = le(body + 12, 3)
+                          r.minDur = min(r.minDur, dur)
+                          r.totalMs += dur
+                      }
+                      p = body + size + (size & 1)
+                  }
+                  return r
+              }
+
+              /// يرجع نص تحذير لو فيه مخالفة، أو nil لو كل شي تمام
+              static func warning(_ d: Data, animated: Bool) -> String? {
+                  guard let r = inspect(d) else { return tr("ملف WebP غير صالح", "Invalid WebP file") }
+                  if animated {
+                      if d.count > 500_000 { return tr("الحجم أكبر من 500KB", "Size is over 500KB") }
+                      if !r.animated || r.frames < 2 { return tr("الملف ليس متحركاً", "File is not animated") }
+                      if r.width != 512 || r.height != 512 { return tr("الأبعاد ليست 512×512", "Size is not 512×512") }
+                      if r.minDur < 8 { return tr("مدة فريم أقل من 8ms", "Frame duration under 8ms") }
+                      if r.totalMs > 10_000 { return tr("المدة أطول من 10 ثواني", "Longer than 10 seconds") }
+                  } else {
+                      if d.count > 100_000 { return tr("الحجم أكبر من 100KB", "Size is over 100KB") }
+                      if r.width != 0 && (r.width != 512 || r.height != 512) { return tr("الأبعاد ليست 512×512", "Size is not 512×512") }
+                  }
+                  return nil
+              }
+          }
+
           enum Imaging {
+              static let videoFPS: Double = 15
+              static let maxSeconds: Double = 10
+
               static func normalize(_ img: UIImage, maxDim: CGFloat = 1280) -> UIImage {
                   let s = min(1, maxDim / max(img.size.width, img.size.height))
                   let size = CGSize(width: img.size.width * s, height: img.size.height * s)
@@ -326,51 +606,58 @@ jobs:
                   } catch { return nil }
               }
 
+              /// فريمات GIF كلها (بحد أقصى 10 ثواني)
               static func gifFrames(_ data: Data) -> (frames: [UIImage], delays: [Double])? {
                   guard let src = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
                   let n = CGImageSourceGetCount(src)
                   guard n > 1 else { return nil }
                   var frames: [UIImage] = []
                   var delays: [Double] = []
+                  var total = 0.0
                   let opts: [CFString: Any] = [
                       kCGImageSourceCreateThumbnailFromImageAlways: true,
                       kCGImageSourceCreateThumbnailWithTransform: true,
-                      kCGImageSourceThumbnailMaxPixelSize: 768
+                      kCGImageSourceThumbnailMaxPixelSize: 512
                   ]
-                  for i in 0..<min(n, 150) {
+                  for i in 0..<n {
                       guard let cg = CGImageSourceCreateThumbnailAtIndex(src, i, opts as CFDictionary) else { continue }
                       let props = CGImageSourceCopyPropertiesAtIndex(src, i, nil) as? [CFString: Any]
                       let g = props?[kCGImagePropertyGIFDictionary] as? [CFString: Any]
-                      let d = (g?[kCGImagePropertyGIFUnclampedDelayTime] as? Double) ?? (g?[kCGImagePropertyGIFDelayTime] as? Double) ?? 0.1
+                      let d = max(0.02, (g?[kCGImagePropertyGIFUnclampedDelayTime] as? Double) ?? (g?[kCGImagePropertyGIFDelayTime] as? Double) ?? 0.1)
+                      if total + d > maxSeconds { break }
+                      total += d
                       frames.append(UIImage(cgImage: cg))
-                      delays.append(max(0.02, d))
+                      delays.append(d)
                   }
-                  return frames.isEmpty ? nil : (frames, delays)
+                  return frames.count > 1 ? (frames, delays) : nil
               }
 
-              static func videoFrame(url: URL, at t: Double) -> UIImage? {
+              static func videoFrame(url: URL, at t: Double, maxSize: CGFloat = 160) -> UIImage? {
                   let gen = AVAssetImageGenerator(asset: AVURLAsset(url: url))
                   gen.appliesPreferredTrackTransform = true
-                  gen.maximumSize = CGSize(width: 1024, height: 1024)
+                  gen.maximumSize = CGSize(width: maxSize, height: maxSize)
                   let time = CMTime(seconds: t, preferredTimescale: 600)
                   if let cg = try? gen.copyCGImage(at: time, actualTime: nil) { return UIImage(cgImage: cg) }
                   return nil
               }
 
-              static func videoFrames(url: URL, start: Double, length: Double, fps: Double) -> [UIImage] {
+              /// يستخرج فريمات الفيديو بمعدل ثابت 15 فريم/ث ويطبق التحويل مباشرة (لتوفير الذاكرة)
+              static func videoFrames(url: URL, start: Double, length: Double, transform: (UIImage) -> UIImage) -> [UIImage] {
                   let gen = AVAssetImageGenerator(asset: AVURLAsset(url: url))
                   gen.appliesPreferredTrackTransform = true
                   gen.maximumSize = CGSize(width: 768, height: 768)
                   gen.requestedTimeToleranceBefore = .zero
                   gen.requestedTimeToleranceAfter = .zero
-                  let n = min(150, max(1, Int(length * fps)))
+                  let n = min(150, max(2, Int(length * videoFPS)))
                   var frames: [UIImage] = []
                   for i in 0..<n {
-                      let t = CMTime(seconds: start + Double(i) / fps, preferredTimescale: 600)
-                      if let cg = try? gen.copyCGImage(at: t, actualTime: nil) {
-                          frames.append(UIImage(cgImage: cg))
-                      } else if let last = frames.last {
-                          frames.append(last)
+                      autoreleasepool {
+                          let t = CMTime(seconds: start + Double(i) / videoFPS, preferredTimescale: 600)
+                          if let cg = try? gen.copyCGImage(at: t, actualTime: nil) {
+                              frames.append(transform(UIImage(cgImage: cg)))
+                          } else if let last = frames.last {
+                              frames.append(last)
+                          }
                       }
                   }
                   return frames
@@ -400,21 +687,27 @@ jobs:
                   return SDImageWebPCoder.shared.encodedData(with: frames[0], format: .webP, options: opts)
               }
 
-              /// ضغط ذكي: يحافظ على كل الفريمات ويضحي بالدقة تدريجياً (ثابت < 100KB ، متحرك < 500KB)
+              /// ضغط ذكي: كل الفريمات تبقى، والدقة والجودة تنزل تدريجياً لين يدخل حد واتساب (ثابت 100KB / متحرك 500KB)
               static func encode(frames: [UIImage], durations: [Double]) -> Data? {
                   guard !frames.isEmpty, durations.count == frames.count else { return nil }
                   let animated = frames.count > 1
                   let limit = animated ? 500_000 : 100_000
-                  let qs: [Double] = animated ? [0.7, 0.45, 0.25] : [0.9, 0.7, 0.45, 0.25]
-                  for s in [1.0, 0.8, 0.6] as [CGFloat] {
+                  let cands: [(CGFloat, Double)] = animated
+                      ? [(1, 0.75), (1, 0.55), (1, 0.35), (0.85, 0.5), (0.85, 0.3), (0.7, 0.4), (0.7, 0.25), (0.55, 0.3), (0.45, 0.2)]
+                      : [(1, 0.9), (1, 0.7), (1, 0.5), (0.85, 0.5), (0.7, 0.4), (0.55, 0.3)]
+                  for (s, q) in cands {
                       let fr = s == 1 ? frames : frames.map { resample($0, s) }
-                      for q in qs {
-                          if let d = encodeOnce(fr, durations, q), d.count < limit { return d }
+                      if animated && fr.count > 30 {
+                          // تقدير سريع للحجم قبل الترميز الكامل
+                          let n = 20
+                          if let p1 = encodeOnce([fr[0]], [durations[0]], q),
+                             let pn = encodeOnce(Array(fr.prefix(n)), Array(durations.prefix(n)), q) {
+                              let delta = Double(max(0, pn.count - p1.count)) / Double(n - 1)
+                              let est = Double(p1.count) + delta * Double(fr.count - 1)
+                              if est > Double(limit) * 1.3 { continue }
+                          }
                       }
-                  }
-                  if animated && frames.count > 12 {
-                      let idx = Array(stride(from: 0, to: frames.count, by: 2))
-                      return encode(frames: idx.map { frames[$0] }, durations: idx.map { durations[$0] * 2 })
+                      if let d = encodeOnce(fr, durations, q), d.count <= limit { return d }
                   }
                   return nil
               }
@@ -450,6 +743,8 @@ jobs:
                   }
               }
           }
+
+          // MARK: - القص
 
           enum CropShape: CaseIterable, Identifiable {
               case square, r43, r34, r169, r916, free
@@ -553,8 +848,89 @@ jobs:
               }
           }
 
+          // MARK: - المعاينة (صورة / GIF / فيديو حي)
+
+          enum Media {
+              case image(UIImage)
+              case frames([UIImage], [Double])
+              case player(AVPlayer)
+          }
+
+          final class PlayerUIView: UIView {
+              override class var layerClass: AnyClass { AVPlayerLayer.self }
+              var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
+          }
+
+          struct PlayerView: UIViewRepresentable {
+              let player: AVPlayer
+              func makeUIView(context: Context) -> PlayerUIView {
+                  let v = PlayerUIView()
+                  v.backgroundColor = .clear
+                  v.playerLayer.videoGravity = .resizeAspect
+                  v.playerLayer.player = player
+                  return v
+              }
+              func updateUIView(_ v: PlayerUIView, context: Context) { v.playerLayer.player = player }
+          }
+
+          struct FramesView: View {
+              let frames: [UIImage]
+              let delays: [Double]
+              var body: some View {
+                  let total = max(0.04, delays.reduce(0, +))
+                  TimelineView(.animation) { ctx in
+                      let t = ctx.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: total)
+                      Image(uiImage: frames[index(t)]).resizable().scaledToFit()
+                  }
+              }
+              private func index(_ t: Double) -> Int {
+                  var acc = 0.0
+                  for (i, d) in delays.enumerated() {
+                      acc += d
+                      if t < acc { return i }
+                  }
+                  return frames.count - 1
+              }
+          }
+
+          final class VideoController: ObservableObject {
+              let player = AVPlayer()
+              var start = 0.0
+              var end = 3.0
+              private var obs: Any?
+
+              func load(url: URL) {
+                  player.replaceCurrentItem(with: AVPlayerItem(url: url))
+                  player.isMuted = true
+                  obs = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.04, preferredTimescale: 600), queue: .main) { [weak self] t in
+                      guard let self else { return }
+                      if t.seconds >= self.end - 0.02 { self.seek(self.start) }
+                  }
+                  seek(start)
+                  player.play()
+              }
+
+              func seek(_ t: Double) {
+                  player.seek(to: CMTime(seconds: t, preferredTimescale: 600))
+              }
+
+              func setRange(start: Double, end: Double) {
+                  self.start = start
+                  self.end = end
+                  seek(start)
+                  player.play()
+              }
+
+              func stop() { player.pause() }
+
+              deinit {
+                  if let o = obs { player.removeTimeObserver(o) }
+                  player.pause()
+              }
+          }
+
           struct EditCanvas: View {
-              let image: UIImage
+              let media: Media
               @Binding var p: EditParams
               var drawing: Bool
               @GestureState private var pinch: CGFloat = 1
@@ -574,7 +950,7 @@ jobs:
                       .onEnded { v in p.scale = min(8, max(0.2, p.scale * v)) }
                   ZStack {
                       Rectangle().fill(Color.gray.opacity(0.18))
-                      Image(uiImage: image).resizable().scaledToFit().frame(width: S, height: S)
+                      mediaView(S)
                           .scaleEffect(p.scale * pinch)
                           .offset(x: p.offset.width + drag.width, y: p.offset.height + drag.height)
                       CropDim(shape: p.shape, S: S, lasso: p.lasso)
@@ -588,6 +964,17 @@ jobs:
                   .clipped()
                   .coordinateSpace(name: "canvas")
                   .gesture(move.simultaneously(with: zoom), including: drawing ? .none : .all)
+              }
+
+              @ViewBuilder private func mediaView(_ S: CGFloat) -> some View {
+                  switch media {
+                  case .image(let img):
+                      Image(uiImage: img).resizable().scaledToFit().frame(width: S, height: S)
+                  case .frames(let fr, let ds):
+                      FramesView(frames: fr, delays: ds).frame(width: S, height: S)
+                  case .player(let pl):
+                      PlayerView(player: pl).frame(width: S, height: S)
+                  }
               }
 
               @ViewBuilder private var outline: some View {
@@ -633,6 +1020,92 @@ jobs:
               }
           }
 
+          // MARK: - شريط تحديد المقطع (أقصى 10 ثواني)
+
+          struct TrimBar: View {
+              @Binding var start: Double
+              @Binding var end: Double
+              let duration: Double
+              let thumbs: [UIImage]
+              var onChange: () -> Void
+              private let H: CGFloat = 56
+              private let hw: CGFloat = 18
+              private let minLen = 0.5
+              private let maxLen = Imaging.maxSeconds
+
+              var body: some View {
+                  GeometryReader { geo in
+                      let W = geo.size.width
+                      let x0 = CGFloat(start / duration) * W
+                      let x1 = CGFloat(end / duration) * W
+                      ZStack(alignment: .topLeading) {
+                          HStack(spacing: 0) {
+                              ForEach(thumbs.indices, id: \.self) { i in
+                                  Image(uiImage: thumbs[i]).resizable().scaledToFill()
+                                      .frame(width: W / CGFloat(max(1, thumbs.count)), height: H).clipped()
+                              }
+                          }
+                          .frame(width: W, height: H, alignment: .leading)
+                          .background(Color.gray.opacity(0.3))
+                          .clipShape(RoundedRectangle(cornerRadius: 8))
+
+                          Rectangle().fill(Color.black.opacity(0.6)).frame(width: max(0, x0), height: H)
+                          Rectangle().fill(Color.black.opacity(0.6)).frame(width: max(0, W - x1), height: H).offset(x: x1)
+                          Rectangle().stroke(Color.yellow, lineWidth: 3).frame(width: max(hw * 2, x1 - x0), height: H).offset(x: x0)
+
+                          handle("chevron.compact.right")
+                              .offset(x: x0)
+                              .gesture(DragGesture(minimumDistance: 0, coordinateSpace: .named("trim")).onChanged { v in
+                                  var s = Double((v.location.x - hw / 2) / W) * duration
+                                  s = max(0, min(s, end - minLen))
+                                  s = max(s, end - maxLen)
+                                  start = s
+                                  onChange()
+                              })
+                          handle("chevron.compact.left")
+                              .offset(x: x1 - hw)
+                              .gesture(DragGesture(minimumDistance: 0, coordinateSpace: .named("trim")).onChanged { v in
+                                  var e = Double((v.location.x + hw / 2) / W) * duration
+                                  e = min(duration, max(e, start + minLen))
+                                  e = min(e, start + maxLen)
+                                  end = e
+                                  onChange()
+                              })
+                      }
+                      .frame(width: W, height: H)
+                      .coordinateSpace(name: "trim")
+                  }
+                  .frame(height: H)
+              }
+
+              private func handle(_ icon: String) -> some View {
+                  Rectangle().fill(Color.yellow).frame(width: hw, height: H)
+                      .overlay(Image(systemName: icon).foregroundColor(.black))
+              }
+          }
+
+          // MARK: - الإيموجي (واحد فقط)
+
+          struct EmojiGrid: View {
+              @Binding var selection: String
+              static let all: [String] = ["❤️"] + Array("😀😁😂🤣😊😍🥰😘😎🤩🥳😜🤪😏😴🤔🙄😮😢😭😡🤯😱🥶🤢🤡👻💀👽🤖🎃👍👎👏🙌🙏💪👀🧡💛💚💙💜🖤💔🔥✨🌟💯🎉🎂🍕🍔🍟🍺🎮🚗🐶🐱🐼🦁🐸🙈").map { String($0) }
+
+              var body: some View {
+                  VStack(alignment: .leading, spacing: 6) {
+                      Text(tr("اختر إيموجي واحد للستيكر", "Pick one emoji for the sticker")).font(.footnote).foregroundStyle(.secondary)
+                      LazyVGrid(columns: [GridItem(.adaptive(minimum: 44))], spacing: 6) {
+                          ForEach(EmojiGrid.all, id: \.self) { e in
+                              Button { selection = e } label: {
+                                  Text(e).font(.system(size: 28)).frame(width: 44, height: 44)
+                                      .background(selection == e ? Color.accentColor.opacity(0.3) : Color.clear,
+                                                  in: RoundedRectangle(cornerRadius: 10))
+                              }.buttonStyle(.plain)
+                          }
+                      }
+                  }
+              }
+          }
+
           struct AnimView: UIViewRepresentable {
               let data: Data
               func makeUIView(context: Context) -> SDAnimatedImageView {
@@ -646,38 +1119,22 @@ jobs:
               func updateUIView(_ v: SDAnimatedImageView, context: Context) {}
           }
 
-          struct EmojiGrid: View {
-              @Binding var selection: [String]
-              static let all: [String] = ["❤️"] + Array("😀😁😂🤣😊😍🥰😘😎🤩🥳😜🤪😏😴🤔🙄😮😢😭😡🤯😱🥶🤢🤡👻💀👽🤖🎃👍👎👏🙌🙏💪👀🧡💛💚💙💜🖤💔🔥✨🌟💯🎉🎂🍕🍔🍟🍺🎮🚗🐶🐱🐼🦁🐸🙈").map { String($0) }
-
-              var body: some View {
-                  VStack(alignment: .leading, spacing: 6) {
-                      Text(tr("اختر إيموجي (حتى 3)", "Pick emojis (up to 3)")).font(.footnote).foregroundStyle(.secondary)
-                      LazyVGrid(columns: [GridItem(.adaptive(minimum: 44))], spacing: 6) {
-                          ForEach(EmojiGrid.all, id: \.self) { e in
-                              Button {
-                                  if let i = selection.firstIndex(of: e) { selection.remove(at: i) }
-                                  else if selection.count < 3 { selection.append(e) }
-                              } label: {
-                                  Text(e).font(.system(size: 28)).frame(width: 44, height: 44)
-                                      .background(selection.contains(e) ? Color.accentColor.opacity(0.3) : Color.clear,
-                                                  in: RoundedRectangle(cornerRadius: 10))
-                              }.buttonStyle(.plain)
-                          }
-                      }
-                  }
-              }
-          }
-
           struct EmojiSheet: View {
-              @Binding var selection: [String]
+              @Binding var selection: String
               let data: Data?
+              let warning: String?
               var onSave: () -> Void
               var body: some View {
                   NavigationStack {
                       ScrollView {
                           VStack(spacing: 16) {
                               if let data { AnimView(data: data).frame(width: 160, height: 160) }
+                              if let data {
+                                  Text(String(format: "%.0f KB", Double(data.count) / 1024)).font(.caption).foregroundStyle(.secondary)
+                              }
+                              if let warning {
+                                  Text(tr("تحذير: ", "Warning: ") + warning).font(.footnote).foregroundStyle(.orange)
+                              }
                               EmojiGrid(selection: $selection)
                           }.padding()
                       }
@@ -685,12 +1142,14 @@ jobs:
                       .navigationBarTitleDisplayMode(.inline)
                       .toolbar {
                           ToolbarItem(placement: .topBarTrailing) {
-                              Button(tr("حفظ", "Save"), action: onSave).disabled(selection.isEmpty)
+                              Button(tr("حفظ", "Save"), action: onSave)
                           }
                       }
                   }
               }
           }
+
+          // MARK: - المحرر
 
           struct StickerEditor: View {
               let packID: String
@@ -698,7 +1157,7 @@ jobs:
               let source: Source
               @EnvironmentObject var lib: Library
               @Environment(\.dismiss) private var dismiss
-              @AppStorage("fps") private var fps = 15
+              @StateObject private var vc = VideoController()
 
               @State private var original: UIImage?
               @State private var working: UIImage?
@@ -708,28 +1167,43 @@ jobs:
               @State private var drawing = false
               @State private var vidDur = 0.0
               @State private var start = 0.0
-              @State private var length = 3.0
+              @State private var end = 3.0
+              @State private var thumbs: [UIImage] = []
               @State private var busy = false
               @State private var error: String?
               @State private var pendingData: Data?
-              @State private var emojis: [String] = ["😀"]
+              @State private var warning: String?
+              @State private var emoji = "😀"
               @State private var showEmoji = false
 
               private var isImage: Bool { if case .image = source { return true }; return false }
               private var isVideo: Bool { if case .video = source { return true }; return false }
+              private var isGif: Bool { if case .gif = source { return true }; return false }
+
+              private var media: Media? {
+                  switch source {
+                  case .image: if let w = working { return .image(w) } else { return nil }
+                  case .gif(let fr, let d): return .frames(fr, d)
+                  case .video: return .player(vc.player)
+                  }
+              }
 
               var body: some View {
                   NavigationStack {
                       ScrollView {
                           VStack(spacing: 14) {
                               canvas
+                              if isVideo && vidDur > 0 { trimSection }
+                              if isVideo || isGif {
+                                  Text(tr("الدقة 512×512 و15 فريم بالثانية، حسب متطلبات واتساب", "512×512 at 15 fps, per WhatsApp requirements"))
+                                      .font(.caption).foregroundStyle(.secondary)
+                              }
                               shapeChips
                               if p.shape == .free { lassoControls }
                               zoomRow
                               textRow
                               if isImage { Toggle(tr("حذف الخلفية بالذكاء الاصطناعي (iOS 17+)", "Remove background with AI (iOS 17+)"), isOn: $removeBG) }
                               if isImage && animatedPack { effectRow }
-                              if isVideo && vidDur > 0 { videoRow }
                               if let error { Text(error).foregroundStyle(.red).font(.footnote) }
                           }.padding()
                       }
@@ -737,19 +1211,20 @@ jobs:
                       .navigationBarTitleDisplayMode(.inline)
                       .toolbar {
                           ToolbarItem(placement: .topBarLeading) {
-                              Button(tr("إلغاء", "Cancel")) { dismiss() }
+                              Button(tr("إلغاء", "Cancel")) { vc.stop(); dismiss() }
                           }
                           ToolbarItem(placement: .topBarTrailing) {
                               if busy { ProgressView() }
-                              else { Button(tr("التالي", "Next"), action: export).disabled(working == nil) }
+                              else { Button(tr("التالي", "Next"), action: export).disabled(media == nil) }
                           }
                       }
                       .task { await prepare() }
                       .onChange(of: removeBG) { on in toggleBG(on) }
                       .sheet(isPresented: $showEmoji) {
-                          EmojiSheet(selection: $emojis, data: pendingData) {
-                              if let d = pendingData { lib.addSticker(packID, data: d, emojis: emojis) }
+                          EmojiSheet(selection: $emoji, data: pendingData, warning: warning) {
+                              if let d = pendingData { lib.addSticker(packID, data: d, emojis: [emoji]) }
                               showEmoji = false
+                              vc.stop()
                               dismiss()
                           }
                       }
@@ -758,11 +1233,24 @@ jobs:
 
               private var canvas: some View {
                   Group {
-                      if let w = working {
-                          EditCanvas(image: w, p: $p, drawing: drawing && p.shape == .free)
+                      if let m = media {
+                          EditCanvas(media: m, p: $p, drawing: drawing && p.shape == .free)
                       } else {
                           ProgressView().frame(width: p.S, height: p.S)
                       }
+                  }
+              }
+
+              private var trimSection: some View {
+                  VStack(spacing: 6) {
+                      TrimBar(start: $start, end: $end, duration: vidDur, thumbs: thumbs) {
+                          vc.setRange(start: start, end: end)
+                      }
+                      HStack {
+                          Text(String(format: "%.1f – %.1f", start, end)).font(.caption)
+                          Spacer()
+                          Text(String(format: tr("المدة %.1f ث (الحد الأقصى 10)", "Length %.1fs (max 10)"), end - start)).font(.caption)
+                      }.foregroundStyle(.secondary)
                   }
               }
 
@@ -823,26 +1311,6 @@ jobs:
                   }
               }
 
-              private var videoRow: some View {
-                  VStack(spacing: 8) {
-                      HStack {
-                          Text(tr("البداية", "Start")).frame(width: 60, alignment: .leading)
-                          Slider(value: $start, in: 0...max(0.1, vidDur - 0.3), onEditingChanged: { e in
-                              if !e { Task { await loadPreview() } }
-                          })
-                          Text(String(format: "%.1fs", start)).font(.caption).frame(width: 44)
-                      }
-                      HStack {
-                          Text(tr("المدة", "Length")).frame(width: 60, alignment: .leading)
-                          Slider(value: $length, in: 0.3...max(0.4, min(8, vidDur)))
-                          Text(String(format: "%.1fs", length)).font(.caption).frame(width: 44)
-                      }
-                      Picker("FPS", selection: $fps) {
-                          ForEach([10, 15, 20, 24], id: \.self) { Text("\($0) fps").tag($0) }
-                      }.pickerStyle(.segmented)
-                  }
-              }
-
               private func prepare() async {
                   switch source {
                   case .image(let ui):
@@ -852,17 +1320,24 @@ jobs:
                   case .video(let url):
                       let d = (try? await AVURLAsset(url: url).load(.duration)).map { CMTimeGetSeconds($0) } ?? 0
                       vidDur = d.isFinite ? d : 0
-                      length = min(6, max(0.5, vidDur))
-                      await loadPreview()
+                      guard vidDur > 0 else { error = tr("تعذر قراءة الفيديو", "Could not read the video"); return }
+                      start = 0
+                      end = min(Imaging.maxSeconds, vidDur)
+                      vc.start = start
+                      vc.end = end
+                      vc.load(url: url)
+                      let dur = vidDur
+                      let t = await Task.detached { () -> [UIImage] in
+                          let n = 12
+                          var out: [UIImage] = []
+                          for i in 0..<n {
+                              let time = dur * (Double(i) + 0.5) / Double(n)
+                              if let img = Imaging.videoFrame(url: url, at: time) { out.append(img) }
+                          }
+                          return out
+                      }.value
+                      thumbs = t
                   }
-              }
-
-              private func loadPreview() async {
-                  guard case .video(let url) = source else { return }
-                  let t = start
-                  let img = await Task.detached { Imaging.videoFrame(url: url, at: t) }.value
-                  original = img
-                  working = img
               }
 
               private func toggleBG(_ on: Bool) {
@@ -874,22 +1349,22 @@ jobs:
                       await MainActor.run {
                           busy = false
                           if let m { working = m }
-                          else { error = tr("حذف الخلفية يحتاج iOS 17 وما لقى عنصر واضح", "Background removal needs iOS 17 and a clear subject") }
+                          else { error = tr("حذف الخلفية يحتاج iOS 17 وعنصر واضح بالصورة", "Background removal needs iOS 17 and a clear subject") }
                       }
                   }
               }
 
               private func export() {
                   guard !busy else { return }
+                  vc.stop()
                   let params = p
                   busy = true; error = nil
                   let src = source
                   let w = working
                   let eff = effect
                   let animated = animatedPack
-                  let fpsV = Double(fps)
                   let st = start
-                  let len = min(length, max(0.5, vidDur - start))
+                  let len = max(0.5, end - start)
                   Task.detached(priority: .userInitiated) {
                       var frames: [UIImage] = []
                       var durs: [Double] = []
@@ -908,15 +1383,21 @@ jobs:
                           frames = fr.map { params.render($0) }
                           durs = d
                       case .video(let url):
-                          let raw = Imaging.videoFrames(url: url, start: st, length: len, fps: fpsV)
-                          frames = raw.map { params.render($0) }
-                          durs = Array(repeating: 1.0 / fpsV, count: frames.count)
+                          frames = Imaging.videoFrames(url: url, start: st, length: len) { params.render($0) }
+                          durs = Array(repeating: 1.0 / Imaging.videoFPS, count: frames.count)
                       }
                       let data = frames.isEmpty ? nil : Imaging.encode(frames: frames, durations: durs)
+                      let warn = data.flatMap { WebPInfo.warning($0, animated: frames.count > 1) }
                       await MainActor.run {
                           busy = false
-                          if let data { pendingData = data; showEmoji = true }
-                          else { error = tr("تعذر ضغط الستيكر للحجم المطلوب، جرّب مدة أقصر", "Could not compress to the required size, try a shorter clip") }
+                          if let data {
+                              pendingData = data
+                              warning = warn
+                              showEmoji = true
+                          } else {
+                              error = tr("تعذر ضغط الستيكر ليدخل حد واتساب، جرّب مقطع أقصر أو أبسط", "Could not compress to WhatsApp's limit, try a shorter or simpler clip")
+                              if isVideo { vc.setRange(start: start, end: end) }
+                          }
                       }
                   }
               }
@@ -925,6 +1406,7 @@ jobs:
           cat > Sources/Views.swift <<'EOF_FILE'
           import SwiftUI
           import PhotosUI
+          import UniformTypeIdentifiers
 
           struct HomeView: View {
               @EnvironmentObject var lib: Library
@@ -937,6 +1419,7 @@ jobs:
                       Group {
                           if lib.packs.isEmpty { emptyState } else { list }
                       }
+                      .appBackdrop()
                       .navigationTitle("Stickify")
                       .navigationDestination(for: String.self) { id in PackView(packID: id) }
                       .toolbar {
@@ -980,13 +1463,14 @@ jobs:
               var body: some View {
                   HStack(spacing: 12) {
                       ZStack {
-                          RoundedRectangle(cornerRadius: 12).fill(Color.gray.opacity(0.15))
                           if let f = pack.stickers.first {
                               Image(uiImage: lib.thumb(f.id)).resizable().scaledToFit().padding(6)
                           } else {
                               Image(systemName: "face.smiling").foregroundStyle(.secondary)
                           }
-                      }.frame(width: 56, height: 56)
+                      }
+                      .frame(width: 56, height: 56)
+                      .panel(RoundedRectangle(cornerRadius: 12))
                       VStack(alignment: .leading, spacing: 4) {
                           Text(pack.name).font(.headline)
                           Text("\(pack.stickers.count)/30 · " + (pack.animated ? tr("متحركة", "Animated") : tr("صور", "Images")))
@@ -1017,6 +1501,7 @@ jobs:
                               TextField(tr("الناشر", "Publisher"), text: $publisher)
                           }
                       }
+                      .appBackdrop()
                       .navigationTitle(tr("حزمة جديدة", "New pack"))
                       .navigationBarTitleDisplayMode(.inline)
                       .onAppear { publisher = defaultPublisher }
@@ -1084,7 +1569,7 @@ jobs:
                               ForEach(pack.stickers) { s in
                                   Button { detail = s } label: {
                                       Image(uiImage: lib.thumb(s.id)).resizable().scaledToFit().padding(6)
-                                          .background(Color.gray.opacity(0.15), in: RoundedRectangle(cornerRadius: 12))
+                                          .panel(RoundedRectangle(cornerRadius: 12))
                                           .overlay(alignment: .bottomTrailing) {
                                               Text(s.emojis.first ?? "").font(.caption).padding(3)
                                           }
@@ -1097,10 +1582,11 @@ jobs:
                       } label: {
                           Label(tr("إضافة إلى واتساب", "Add to WhatsApp"), systemImage: "paperplane.fill")
                               .frame(maxWidth: .infinity).padding()
-                              .background(Color.green, in: RoundedRectangle(cornerRadius: 14))
                               .foregroundStyle(.white)
+                              .panel(RoundedRectangle(cornerRadius: 16), tint: .green)
                       }.padding(.horizontal).padding(.bottom, 8)
                   }
+                  .appBackdrop()
                   .navigationTitle(pack.name)
                   .navigationBarTitleDisplayMode(.inline)
                   .toolbar {
@@ -1115,7 +1601,11 @@ jobs:
                           }
                       }
                   }
-                  .overlay { if loading { ProgressView().padding(24).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14)) } }
+                  .overlay {
+                      if loading {
+                          ProgressView().padding(24).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+                      }
+                  }
                   .onChange(of: pick) { _ in Task { await loadPick(pack.animated) } }
                   .fullScreenCover(item: $job) { j in
                       StickerEditor(packID: packID, animatedPack: pack.animated, source: j.source)
@@ -1157,14 +1647,14 @@ jobs:
               let sticker: StickerMeta
               @EnvironmentObject var lib: Library
               @Environment(\.dismiss) private var dismiss
-              @State private var emojis: [String] = []
+              @State private var emoji = "😀"
 
               var body: some View {
                   NavigationStack {
                       ScrollView {
                           VStack(spacing: 16) {
                               if let d = lib.data(sticker.id) { AnimView(data: d).frame(width: 200, height: 200) }
-                              EmojiGrid(selection: $emojis)
+                              EmojiGrid(selection: $emoji)
                               Button(role: .destructive) {
                                   lib.deleteSticker(packID, sticker.id)
                                   dismiss()
@@ -1173,11 +1663,11 @@ jobs:
                       }
                       .navigationTitle(tr("ستيكر", "Sticker"))
                       .navigationBarTitleDisplayMode(.inline)
-                      .onAppear { emojis = sticker.emojis }
+                      .onAppear { emoji = sticker.emojis.first ?? "😀" }
                       .toolbar {
                           ToolbarItem(placement: .topBarTrailing) {
                               Button(tr("تم", "Done")) {
-                                  if !emojis.isEmpty { lib.setEmojis(packID, sticker.id, emojis) }
+                                  lib.setEmojis(packID, sticker.id, [emoji])
                                   dismiss()
                               }
                           }
@@ -1186,55 +1676,166 @@ jobs:
               }
           }
 
+          struct LinkItem: Codable, Identifiable {
+              var id = UUID().uuidString
+              var title: String
+              var url: String
+          }
+
           struct SettingsView: View {
+              @EnvironmentObject var lib: Library
               @Environment(\.dismiss) private var dismiss
               @AppStorage("lang") private var lang = "ar"
               @AppStorage("theme") private var theme = 0
               @AppStorage("accent") private var accent = 0
+              @AppStorage("glass") private var glass = false
               @AppStorage("publisher") private var publisher = ""
-              @AppStorage("fps") private var fps = 15
+              @AppStorage("links") private var linksJSON = "[]"
+
+              @State private var showAddLink = false
+              @State private var linkTitle = ""
+              @State private var linkURL = ""
+              @State private var shareItem: ShareItem?
+              @State private var showImport = false
+              @State private var showWipe = false
+              @State private var info: String?
+
+              private var links: [LinkItem] {
+                  (try? JSONDecoder().decode([LinkItem].self, from: Data(linksJSON.utf8))) ?? []
+              }
+
+              private func saveLinks(_ l: [LinkItem]) {
+                  if let d = try? JSONEncoder().encode(l), let s = String(data: d, encoding: .utf8) { linksJSON = s }
+              }
 
               var body: some View {
                   NavigationStack {
                       Form {
-                          Section(tr("اللغة", "Language")) {
-                              Picker("", selection: $lang) {
-                                  Text("العربية").tag("ar")
-                                  Text("English").tag("en")
-                              }.pickerStyle(.segmented)
-                          }
-                          Section(tr("المظهر", "Appearance")) {
-                              Picker("", selection: $theme) {
-                                  Text(tr("تلقائي", "System")).tag(0)
-                                  Text(tr("فاتح", "Light")).tag(1)
-                                  Text(tr("داكن", "Dark")).tag(2)
-                              }.pickerStyle(.segmented)
-                              HStack(spacing: 14) {
-                                  Text(tr("لون التطبيق", "Accent color"))
-                                  Spacer()
-                                  ForEach(0..<Palette.colors.count, id: \.self) { i in
-                                      Circle().fill(Palette.colors[i]).frame(width: 28, height: 28)
-                                          .overlay(Circle().stroke(Color.primary, lineWidth: accent == i ? 3 : 0))
-                                          .onTapGesture { accent = i }
-                                  }
-                              }
-                          }
+                          languageSection
+                          appearanceSection
                           Section(tr("افتراضيات", "Defaults")) {
                               TextField(tr("اسم الناشر الافتراضي", "Default publisher name"), text: $publisher)
-                              Picker(tr("إطارات الفيديو بالثانية", "Video frames per second"), selection: $fps) {
-                                  ForEach([10, 15, 20, 24], id: \.self) { Text("\($0)").tag($0) }
-                              }
+                          }
+                          linksSection
+                          backupSection
+                          Section {
+                              Button(tr("مسح كل البيانات", "Delete all data"), role: .destructive) { showWipe = true }
                           }
                           Section(tr("حول", "About")) {
-                              HStack { Text(tr("الإصدار", "Version")); Spacer(); Text("1.1").foregroundStyle(.secondary) }
+                              HStack { Text(tr("الإصدار", "Version")); Spacer(); Text("1.2").foregroundStyle(.secondary) }
                           }
                       }
+                      .appBackdrop()
                       .navigationTitle(tr("الإعدادات", "Settings"))
                       .navigationBarTitleDisplayMode(.inline)
                       .toolbar {
                           ToolbarItem(placement: .topBarTrailing) { Button(tr("تم", "Done")) { dismiss() } }
                       }
+                      .alert(tr("رابط جديد", "New link"), isPresented: $showAddLink) {
+                          TextField(tr("العنوان", "Title"), text: $linkTitle)
+                          TextField("https://", text: $linkURL).keyboardType(.URL).textInputAutocapitalization(.never)
+                          Button(tr("إضافة", "Add")) { addLink() }
+                          Button(tr("إلغاء", "Cancel"), role: .cancel) {}
+                      }
+                      .confirmationDialog(tr("مسح كل الحزم والستيكرات؟", "Delete all packs and stickers?"),
+                                          isPresented: $showWipe, titleVisibility: .visible) {
+                          Button(tr("مسح", "Delete"), role: .destructive) { lib.deleteAll() }
+                      }
+                      .sheet(item: $shareItem) { ShareSheet(url: $0.url) }
+                      .fileImporter(isPresented: $showImport, allowedContentTypes: [.zip]) { result in
+                          handleImport(result)
+                      }
+                      .alert(tr("النسخ الاحتياطي", "Backup"), isPresented: Binding(get: { info != nil }, set: { if !$0 { info = nil } })) {
+                          Button("OK", role: .cancel) {}
+                      } message: { Text(info ?? "") }
                   }
+              }
+
+              private var languageSection: some View {
+                  Section(tr("اللغة", "Language")) {
+                      Picker("", selection: $lang) {
+                          Text("العربية").tag("ar")
+                          Text("English").tag("en")
+                      }.pickerStyle(.segmented)
+                  }
+              }
+
+              private var appearanceSection: some View {
+                  Section(tr("المظهر", "Appearance")) {
+                      Picker("", selection: $theme) {
+                          Text(tr("تلقائي", "System")).tag(0)
+                          Text(tr("فاتح", "Light")).tag(1)
+                          Text(tr("داكن", "Dark")).tag(2)
+                      }.pickerStyle(.segmented)
+                      HStack(spacing: 14) {
+                          Text(tr("لون التطبيق", "Accent color"))
+                          Spacer()
+                          ForEach(0..<Palette.colors.count, id: \.self) { i in
+                              Circle().fill(Palette.colors[i]).frame(width: 28, height: 28)
+                                  .overlay(Circle().stroke(Color.primary, lineWidth: accent == i ? 3 : 0))
+                                  .onTapGesture { accent = i }
+                          }
+                      }
+                      Toggle("Liquid Glass", isOn: $glass)
+                      Text(tr("يعمل بالكامل على iOS 26 وما فوق، وعلى الأقدم يظهر بشكل شفاف مبسّط", "Full effect on iOS 26 and later, simplified translucency on older versions"))
+                          .font(.caption).foregroundStyle(.secondary)
+                  }
+              }
+
+              private var linksSection: some View {
+                  Section(tr("روابط", "Links")) {
+                      ForEach(links) { l in
+                          if let u = URL(string: l.url) {
+                              Link(destination: u) {
+                                  HStack { Image(systemName: "link"); Text(l.title) }
+                              }
+                          } else {
+                              Text(l.title)
+                          }
+                      }
+                      .onDelete { offsets in
+                          var l = links
+                          l.remove(atOffsets: offsets)
+                          saveLinks(l)
+                      }
+                      Button {
+                          linkTitle = ""; linkURL = ""; showAddLink = true
+                      } label: { Label(tr("إضافة رابط", "Add link"), systemImage: "plus") }
+                  }
+              }
+
+              private var backupSection: some View {
+                  Section(tr("النسخ الاحتياطي", "Backup")) {
+                      Button {
+                          if let u = lib.makeBackup() { shareItem = ShareItem(url: u) }
+                          else { info = tr("تعذر إنشاء النسخة", "Could not create the backup") }
+                      } label: { Label(tr("إنشاء نسخة احتياطية (ZIP)", "Create backup (ZIP)"), systemImage: "square.and.arrow.up") }
+                      .disabled(lib.packs.isEmpty)
+                      Button { showImport = true } label: {
+                          Label(tr("استرجاع من نسخة احتياطية", "Restore from backup"), systemImage: "square.and.arrow.down")
+                      }
+                  }
+              }
+
+              private func addLink() {
+                  let t = linkTitle.trimmingCharacters(in: .whitespaces)
+                  var u = linkURL.trimmingCharacters(in: .whitespaces)
+                  guard !t.isEmpty, !u.isEmpty else { return }
+                  if !u.contains("://") { u = "https://" + u }
+                  var l = links
+                  l.append(LinkItem(title: t, url: u))
+                  saveLinks(l)
+              }
+
+              private func handleImport(_ result: Result<URL, Error>) {
+                  guard case .success(let url) = result else { return }
+                  let ok = url.startAccessingSecurityScopedResource()
+                  defer { if ok { url.stopAccessingSecurityScopedResource() } }
+                  guard let d = try? Data(contentsOf: url), let n = lib.restore(d) else {
+                      info = tr("الملف غير صالح أو تالف", "The file is invalid or corrupted")
+                      return
+                  }
+                  info = tr("تم استرجاع \(n) حزمة", "Restored \(n) pack(s)")
               }
           }
           EOF_FILE
@@ -1244,8 +1845,15 @@ jobs:
           cat > Sources/Assets.xcassets/AppIcon.appiconset/Contents.json <<'EOF_FILE'
           {"images":[{"filename":"icon.png","idiom":"universal","platform":"ios","size":"1024x1024"}],"info":{"author":"xcode","version":1}}
           EOF_FILE
-      - name: Generate app icon
-        run: swift tools/icon.swift Sources/Assets.xcassets/AppIcon.appiconset/icon.png || echo "icon failed"
+      - name: App icon
+        run: |
+          ICON=Sources/Assets.xcassets/AppIcon.appiconset/icon.png
+          if [ -f icon.png ]; then
+            sips -z 1024 1024 -s format jpeg icon.png --out /tmp/icon.jpg
+            sips -s format png /tmp/icon.jpg --out "$ICON"
+          else
+            swift tools/icon.swift "$ICON" || echo "icon failed"
+          fi
       - name: Install XcodeGen
         run: brew install xcodegen
       - name: Generate project
