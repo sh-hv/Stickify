@@ -1,27 +1,1270 @@
-name: Build Stickify IPA
+name: Build IPA
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
+permissions:
+  contents: write
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-      - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode_15.4.app
-      - name: Build Unsigned IPA
+      - name: Create project files
         run: |
-          xcodebuild archive \
-            -project Stickify.xcodeproj \
-            -scheme Stickify \
-            -configuration Release \
-            -archivePath $PWD/build/Stickify.xcarchive \
-            -sdk iphoneos \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
-          mkdir -p Payload
-          cp -r build/Stickify.xcarchive/Products/Applications/Stickify.app Payload/
-          zip -r Stickify-Unsigned.ipa Payload
-      - name: Upload IPA
-        uses: actions/upload-artifact@v4
+          mkdir -p Sources tools Sources/Assets.xcassets/AppIcon.appiconset
+          cat > project.yml <<'EOF_FILE'
+          name: Stickify
+          options:
+            bundleIdPrefix: com.stickify
+            deploymentTarget:
+              iOS: "16.0"
+          packages:
+            SDWebImage:
+              url: https://github.com/SDWebImage/SDWebImage
+              from: 5.19.0
+            SDWebImageWebPCoder:
+              url: https://github.com/SDWebImage/SDWebImageWebPCoder
+              from: 0.14.6
+          targets:
+            Stickify:
+              type: application
+              platform: iOS
+              sources: [Sources]
+              dependencies:
+                - package: SDWebImage
+                  product: SDWebImage
+                - package: SDWebImageWebPCoder
+                  product: SDWebImageWebPCoder
+              info:
+                path: Sources/Info.plist
+                properties:
+                  CFBundleDisplayName: Stickify
+                  UILaunchScreen: {}
+                  LSApplicationQueriesSchemes: [whatsapp]
+                  UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+              settings:
+                base:
+                  PRODUCT_BUNDLE_IDENTIFIER: com.stickify.app
+                  SWIFT_VERSION: "5.0"
+                  MARKETING_VERSION: "1.1"
+                  CURRENT_PROJECT_VERSION: "2"
+                  TARGETED_DEVICE_FAMILY: "1"
+                  ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+          EOF_FILE
+          cat > tools/icon.swift <<'EOF_FILE'
+          import CoreGraphics
+          import ImageIO
+          import Foundation
+
+          let cs = CGColorSpaceCreateDeviceRGB()
+          let ctx = CGContext(data: nil, width: 1024, height: 1024, bitsPerComponent: 8, bytesPerRow: 0, space: cs, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
+          let cols = [CGColor(red: 0.16, green: 0.82, blue: 0.56, alpha: 1), CGColor(red: 0.10, green: 0.42, blue: 0.95, alpha: 1)] as CFArray
+          let grad = CGGradient(colorsSpace: cs, colors: cols, locations: [0, 1])!
+          ctx.drawLinearGradient(grad, start: CGPoint(x: 0, y: 1024), end: CGPoint(x: 1024, y: 0), options: [])
+          ctx.saveGState()
+          ctx.translateBy(x: 512, y: 512)
+          ctx.rotate(by: -0.12)
+          ctx.setShadow(offset: CGSize(width: 0, height: -24), blur: 40, color: CGColor(gray: 0, alpha: 0.35))
+          ctx.setFillColor(CGColor(gray: 1, alpha: 1))
+          ctx.addPath(CGPath(roundedRect: CGRect(x: -300, y: -300, width: 600, height: 600), cornerWidth: 150, cornerHeight: 150, transform: nil))
+          ctx.fillPath()
+          ctx.setShadow(offset: .zero, blur: 0, color: nil)
+          let dark = CGColor(red: 0.10, green: 0.12, blue: 0.20, alpha: 1)
+          ctx.setFillColor(dark)
+          ctx.fillEllipse(in: CGRect(x: -130, y: 40, width: 70, height: 110))
+          ctx.fillEllipse(in: CGRect(x: 60, y: 40, width: 70, height: 110))
+          ctx.setStrokeColor(dark)
+          ctx.setLineWidth(40)
+          ctx.setLineCap(.round)
+          ctx.addArc(center: CGPoint(x: 0, y: -10), radius: 150, startAngle: CGFloat.pi * 1.15, endAngle: CGFloat.pi * 1.85, clockwise: false)
+          ctx.strokePath()
+          ctx.restoreGState()
+          let img = ctx.makeImage()!
+          let url = URL(fileURLWithPath: CommandLine.arguments[1])
+          let dest = CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil)!
+          CGImageDestinationAddImage(dest, img, nil)
+          CGImageDestinationFinalize(dest)
+          EOF_FILE
+          cat > Sources/StickifyApp.swift <<'EOF_FILE'
+          import SwiftUI
+          import UIKit
+          import SDWebImage
+          import SDWebImageWebPCoder
+
+          func tr(_ ar: String, _ en: String) -> String {
+              (UserDefaults.standard.string(forKey: "lang") ?? "ar") == "ar" ? ar : en
+          }
+
+          enum Palette {
+              static let colors: [Color] = [.green, .blue, .purple, .pink, .orange, .teal]
+          }
+
+          struct StickerMeta: Codable, Identifiable, Hashable {
+              var id: String
+              var emojis: [String]
+          }
+
+          struct PackMeta: Codable, Identifiable {
+              var id: String
+              var name: String
+              var publisher: String
+              var animated: Bool
+              var stickers: [StickerMeta]
+          }
+
+          final class Library: ObservableObject {
+              @Published var packs: [PackMeta] = []
+              private let root: URL
+              private let cache = NSCache<NSString, UIImage>()
+
+              init() {
+                  let d = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("StickifyLib")
+                  try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+                  root = d
+                  if let data = try? Data(contentsOf: d.appendingPathComponent("packs.json")),
+                     let p = try? JSONDecoder().decode([PackMeta].self, from: data) { packs = p }
+              }
+
+              private func persist() {
+                  if let d = try? JSONEncoder().encode(packs) {
+                      try? d.write(to: root.appendingPathComponent("packs.json"))
+                  }
+              }
+
+              private func url(_ sid: String) -> URL { root.appendingPathComponent(sid + ".webp") }
+
+              func data(_ sid: String) -> Data? { try? Data(contentsOf: url(sid)) }
+
+              func thumb(_ sid: String) -> UIImage {
+                  if let c = cache.object(forKey: sid as NSString) { return c }
+                  guard let d = data(sid) else { return UIImage() }
+                  let opts: [SDImageCoderOption: Any] = [.decodeFirstFrameOnly: true]
+                  let img = SDImageWebPCoder.shared.decodedImage(with: d, options: opts) ?? UIImage()
+                  cache.setObject(img, forKey: sid as NSString)
+                  return img
+              }
+
+              func addPack(name: String, publisher: String, animated: Bool) -> String {
+                  let p = PackMeta(id: UUID().uuidString, name: name, publisher: publisher, animated: animated, stickers: [])
+                  packs.append(p)
+                  persist()
+                  return p.id
+              }
+
+              func rename(_ id: String, name: String) {
+                  guard let i = packs.firstIndex(where: { $0.id == id }) else { return }
+                  packs[i].name = name
+                  persist()
+              }
+
+              func deletePack(_ id: String) {
+                  guard let i = packs.firstIndex(where: { $0.id == id }) else { return }
+                  for s in packs[i].stickers { try? FileManager.default.removeItem(at: url(s.id)) }
+                  packs.remove(at: i)
+                  persist()
+              }
+
+              func addSticker(_ packID: String, data: Data, emojis: [String]) {
+                  guard let i = packs.firstIndex(where: { $0.id == packID }) else { return }
+                  let sid = UUID().uuidString
+                  try? data.write(to: url(sid))
+                  packs[i].stickers.append(StickerMeta(id: sid, emojis: emojis))
+                  persist()
+              }
+
+              func setEmojis(_ packID: String, _ sid: String, _ emojis: [String]) {
+                  guard let i = packs.firstIndex(where: { $0.id == packID }),
+                        let j = packs[i].stickers.firstIndex(where: { $0.id == sid }) else { return }
+                  packs[i].stickers[j].emojis = emojis
+                  persist()
+              }
+
+              func deleteSticker(_ packID: String, _ sid: String) {
+                  guard let i = packs.firstIndex(where: { $0.id == packID }) else { return }
+                  try? FileManager.default.removeItem(at: url(sid))
+                  packs[i].stickers.removeAll { $0.id == sid }
+                  persist()
+              }
+          }
+
+          enum WhatsApp {
+              static func send(_ pack: PackMeta, lib: Library) -> String? {
+                  guard pack.stickers.count >= 3 else {
+                      return tr("لازم 3 ستيكرات على الأقل (الحد الأقصى 30)", "You need at least 3 stickers (max 30)")
+                  }
+                  guard let wa = URL(string: "whatsapp://stickerPack"), UIApplication.shared.canOpenURL(wa) else {
+                      return tr("واتساب غير مثبت على الجهاز", "WhatsApp is not installed")
+                  }
+                  let list = Array(pack.stickers.prefix(30))
+                  let side: CGFloat = 96
+                  let fmt = UIGraphicsImageRendererFormat(); fmt.scale = 1; fmt.opaque = false
+                  let first = lib.thumb(list[0].id)
+                  let tray = UIGraphicsImageRenderer(size: CGSize(width: side, height: side), format: fmt).image { _ in
+                      first.draw(in: CGRect(x: 0, y: 0, width: side, height: side))
+                  }
+                  guard let trayPNG = tray.pngData() else { return tr("فشل إنشاء أيقونة الحزمة", "Failed to create tray icon") }
+                  var items: [[String: Any]] = []
+                  for s in list {
+                      guard let d = lib.data(s.id) else { continue }
+                      let em = s.emojis.isEmpty ? ["😀"] : Array(s.emojis.prefix(3))
+                      items.append(["image_data": d.base64EncodedString(), "emojis": em])
+                  }
+                  let json: [String: Any] = [
+                      "identifier": pack.id + "." + String(list.count),
+                      "name": pack.name,
+                      "publisher": pack.publisher,
+                      "tray_image": trayPNG.base64EncodedString(),
+                      "is_animated_sticker_pack": pack.animated,
+                      "stickers": items
+                  ]
+                  guard let data = try? JSONSerialization.data(withJSONObject: json) else {
+                      return tr("فشل تجهيز البيانات", "Failed to prepare data")
+                  }
+                  UIPasteboard.general.setItems(
+                      [["net.whatsapp.third-party.sticker-pack": data]],
+                      options: [.localOnly: true, .expirationDate: Date(timeIntervalSinceNow: 60)]
+                  )
+                  UIApplication.shared.open(wa)
+                  return nil
+              }
+          }
+
+          @main
+          struct StickifyApp: App {
+              @StateObject private var lib = Library()
+              @AppStorage("lang") private var lang = "ar"
+              @AppStorage("theme") private var theme = 0
+              @AppStorage("accent") private var accent = 0
+
+              init() { SDImageCodersManager.shared.addCoder(SDImageWebPCoder.shared) }
+
+              var body: some Scene {
+                  WindowGroup {
+                      HomeView()
+                          .id(lang)
+                          .environmentObject(lib)
+                          .environment(\.layoutDirection, lang == "ar" ? .rightToLeft : .leftToRight)
+                          .tint(Palette.colors[min(accent, Palette.colors.count - 1)])
+                          .preferredColorScheme(theme == 1 ? .light : (theme == 2 ? .dark : nil))
+                  }
+              }
+          }
+          EOF_FILE
+          cat > Sources/Imaging.swift <<'EOF_FILE'
+          import UIKit
+          import Vision
+          import CoreImage
+          import ImageIO
+          import AVFoundation
+          import SDWebImage
+          import SDWebImageWebPCoder
+
+          enum Effect: String, CaseIterable, Identifiable {
+              case bounce, shake, pulse, spin, wobble, float
+              var id: String { rawValue }
+              var title: String {
+                  switch self {
+                  case .bounce: return tr("قفز", "Bounce")
+                  case .shake: return tr("اهتزاز", "Shake")
+                  case .pulse: return tr("نبض", "Pulse")
+                  case .spin: return tr("دوران", "Spin")
+                  case .wobble: return tr("تمايل", "Wobble")
+                  case .float: return tr("طفو", "Float")
+                  }
+              }
+
+              func transform(_ p: Double) -> (dx: CGFloat, dy: CGFloat, s: CGFloat, a: CGFloat) {
+                  let t = p * 2 * Double.pi
+                  switch self {
+                  case .bounce: return (0, -CGFloat(abs(sin(t))) * 60, 1, 0)
+                  case .shake:  return (CGFloat(sin(t * 3)) * 30, 0, 1, 0)
+                  case .pulse:  return (0, 0, 1 + 0.15 * CGFloat(sin(t)), 0)
+                  case .spin:   return (0, 0, 0.8, CGFloat(t))
+                  case .wobble: return (0, 0, 1, CGFloat(sin(t)) * 0.25)
+                  case .float:  return (0, CGFloat(sin(t)) * 25, 1 + 0.04 * CGFloat(sin(t)), 0)
+                  }
+              }
+
+              func frames(_ base: UIImage, count: Int = 20) -> [UIImage] {
+                  let fmt = UIGraphicsImageRendererFormat(); fmt.scale = 1; fmt.opaque = false
+                  let r = UIGraphicsImageRenderer(size: CGSize(width: 512, height: 512), format: fmt)
+                  return (0..<count).map { i in
+                      let t = transform(Double(i) / Double(count))
+                      return r.image { ctx in
+                          let c = ctx.cgContext
+                          c.translateBy(x: 256 + t.dx, y: 256 + t.dy)
+                          c.rotate(by: t.a)
+                          c.scaleBy(x: t.s * 0.8, y: t.s * 0.8)
+                          base.draw(in: CGRect(x: -256, y: -256, width: 512, height: 512))
+                      }
+                  }
+              }
+          }
+
+          enum Imaging {
+              static func normalize(_ img: UIImage, maxDim: CGFloat = 1280) -> UIImage {
+                  let s = min(1, maxDim / max(img.size.width, img.size.height))
+                  let size = CGSize(width: img.size.width * s, height: img.size.height * s)
+                  let fmt = UIGraphicsImageRendererFormat(); fmt.scale = 1; fmt.opaque = false
+                  return UIGraphicsImageRenderer(size: size, format: fmt).image { _ in
+                      img.draw(in: CGRect(origin: .zero, size: size))
+                  }
+              }
+
+              static func removeBackground(_ img: UIImage) -> UIImage? {
+                  guard #available(iOS 17.0, *), let cg = img.cgImage else { return nil }
+                  let req = VNGenerateForegroundInstanceMaskRequest()
+                  let handler = VNImageRequestHandler(cgImage: cg)
+                  do {
+                      try handler.perform([req])
+                      guard let obs = req.results?.first else { return nil }
+                      let buf = try obs.generateMaskedImage(ofInstances: obs.allInstances, from: handler, croppedToInstancesExtent: false)
+                      let ci = CIImage(cvPixelBuffer: buf)
+                      guard let out = CIContext().createCGImage(ci, from: ci.extent) else { return nil }
+                      return UIImage(cgImage: out)
+                  } catch { return nil }
+              }
+
+              static func gifFrames(_ data: Data) -> (frames: [UIImage], delays: [Double])? {
+                  guard let src = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+                  let n = CGImageSourceGetCount(src)
+                  guard n > 1 else { return nil }
+                  var frames: [UIImage] = []
+                  var delays: [Double] = []
+                  let opts: [CFString: Any] = [
+                      kCGImageSourceCreateThumbnailFromImageAlways: true,
+                      kCGImageSourceCreateThumbnailWithTransform: true,
+                      kCGImageSourceThumbnailMaxPixelSize: 768
+                  ]
+                  for i in 0..<min(n, 150) {
+                      guard let cg = CGImageSourceCreateThumbnailAtIndex(src, i, opts as CFDictionary) else { continue }
+                      let props = CGImageSourceCopyPropertiesAtIndex(src, i, nil) as? [CFString: Any]
+                      let g = props?[kCGImagePropertyGIFDictionary] as? [CFString: Any]
+                      let d = (g?[kCGImagePropertyGIFUnclampedDelayTime] as? Double) ?? (g?[kCGImagePropertyGIFDelayTime] as? Double) ?? 0.1
+                      frames.append(UIImage(cgImage: cg))
+                      delays.append(max(0.02, d))
+                  }
+                  return frames.isEmpty ? nil : (frames, delays)
+              }
+
+              static func videoFrame(url: URL, at t: Double) -> UIImage? {
+                  let gen = AVAssetImageGenerator(asset: AVURLAsset(url: url))
+                  gen.appliesPreferredTrackTransform = true
+                  gen.maximumSize = CGSize(width: 1024, height: 1024)
+                  let time = CMTime(seconds: t, preferredTimescale: 600)
+                  if let cg = try? gen.copyCGImage(at: time, actualTime: nil) { return UIImage(cgImage: cg) }
+                  return nil
+              }
+
+              static func videoFrames(url: URL, start: Double, length: Double, fps: Double) -> [UIImage] {
+                  let gen = AVAssetImageGenerator(asset: AVURLAsset(url: url))
+                  gen.appliesPreferredTrackTransform = true
+                  gen.maximumSize = CGSize(width: 768, height: 768)
+                  gen.requestedTimeToleranceBefore = .zero
+                  gen.requestedTimeToleranceAfter = .zero
+                  let n = min(150, max(1, Int(length * fps)))
+                  var frames: [UIImage] = []
+                  for i in 0..<n {
+                      let t = CMTime(seconds: start + Double(i) / fps, preferredTimescale: 600)
+                      if let cg = try? gen.copyCGImage(at: t, actualTime: nil) {
+                          frames.append(UIImage(cgImage: cg))
+                      } else if let last = frames.last {
+                          frames.append(last)
+                      }
+                  }
+                  return frames
+              }
+
+              static func resample(_ img: UIImage, _ s: CGFloat) -> UIImage {
+                  let small = CGSize(width: 512 * s, height: 512 * s)
+                  let f = UIGraphicsImageRendererFormat(); f.scale = 1; f.opaque = false
+                  let a = UIGraphicsImageRenderer(size: small, format: f).image { _ in
+                      img.draw(in: CGRect(origin: .zero, size: small))
+                  }
+                  return UIGraphicsImageRenderer(size: CGSize(width: 512, height: 512), format: f).image { _ in
+                      a.draw(in: CGRect(x: 0, y: 0, width: 512, height: 512))
+                  }
+              }
+
+              private static func encodeOnce(_ frames: [UIImage], _ durs: [Double], _ q: Double) -> Data? {
+                  let opts: [SDImageCoderOption: Any] = [.encodeCompressionQuality: q]
+                  if frames.count > 1 {
+                      var fr: [SDImageFrame] = []
+                      for (i, f) in frames.enumerated() {
+                          fr.append(SDImageFrame(image: f, duration: max(0.02, durs[i])))
+                      }
+                      guard let anim = SDImageCoderHelper.animatedImage(with: fr) else { return nil }
+                      return SDImageWebPCoder.shared.encodedData(with: anim, format: .webP, options: opts)
+                  }
+                  return SDImageWebPCoder.shared.encodedData(with: frames[0], format: .webP, options: opts)
+              }
+
+              /// ضغط ذكي: يحافظ على كل الفريمات ويضحي بالدقة تدريجياً (ثابت < 100KB ، متحرك < 500KB)
+              static func encode(frames: [UIImage], durations: [Double]) -> Data? {
+                  guard !frames.isEmpty, durations.count == frames.count else { return nil }
+                  let animated = frames.count > 1
+                  let limit = animated ? 500_000 : 100_000
+                  let qs: [Double] = animated ? [0.7, 0.45, 0.25] : [0.9, 0.7, 0.45, 0.25]
+                  for s in [1.0, 0.8, 0.6] as [CGFloat] {
+                      let fr = s == 1 ? frames : frames.map { resample($0, s) }
+                      for q in qs {
+                          if let d = encodeOnce(fr, durations, q), d.count < limit { return d }
+                      }
+                  }
+                  if animated && frames.count > 12 {
+                      let idx = Array(stride(from: 0, to: frames.count, by: 2))
+                      return encode(frames: idx.map { frames[$0] }, durations: idx.map { durations[$0] * 2 })
+                  }
+                  return nil
+              }
+          }
+          EOF_FILE
+          cat > Sources/Editor.swift <<'EOF_FILE'
+          import SwiftUI
+          import PhotosUI
+          import AVFoundation
+          import UniformTypeIdentifiers
+          import SDWebImage
+
+          enum Source {
+              case image(UIImage)
+              case gif([UIImage], [Double])
+              case video(URL)
+          }
+
+          struct EditJob: Identifiable {
+              let id = UUID()
+              let source: Source
+          }
+
+          struct Movie: Transferable {
+              let url: URL
+              static var transferRepresentation: some TransferRepresentation {
+                  FileRepresentation(contentType: .movie) { movie in
+                      SentTransferredFile(movie.url)
+                  } importing: { received in
+                      let dst = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".mov")
+                      try FileManager.default.copyItem(at: received.file, to: dst)
+                      return Movie(url: dst)
+                  }
+              }
+          }
+
+          enum CropShape: CaseIterable, Identifiable {
+              case square, r43, r34, r169, r916, free
+              var id: Self { self }
+              var title: String {
+                  switch self {
+                  case .square: return tr("مربع", "Square")
+                  case .r43: return "4:3"
+                  case .r34: return "3:4"
+                  case .r169: return "16:9"
+                  case .r916: return "9:16"
+                  case .free: return tr("مخصص", "Free")
+                  }
+              }
+              var ratio: CGFloat? {
+                  switch self {
+                  case .square: return 1
+                  case .r43: return 4.0 / 3.0
+                  case .r34: return 3.0 / 4.0
+                  case .r169: return 16.0 / 9.0
+                  case .r916: return 9.0 / 16.0
+                  case .free: return nil
+                  }
+              }
+              func rect(_ S: CGFloat) -> CGRect {
+                  guard let r = ratio else { return CGRect(x: 0, y: 0, width: S, height: S) }
+                  var w = S, h = S
+                  if r >= 1 { h = S / r } else { w = S * r }
+                  return CGRect(x: (S - w) / 2, y: (S - h) / 2, width: w, height: h)
+              }
+          }
+
+          struct EditParams {
+              var S: CGFloat
+              var scale: CGFloat = 1
+              var offset: CGSize = .zero
+              var shape: CropShape = .square
+              var lasso: [CGPoint] = []
+              var text: String = ""
+              var textColor: Color = .white
+              var textSize: CGFloat = 56
+              var textPos: CGPoint = CGPoint(x: 0.5, y: 0.8)
+
+              func render(_ src: UIImage) -> UIImage {
+                  let k = 512 / S
+                  let f = UIGraphicsImageRendererFormat(); f.scale = 1; f.opaque = false
+                  return UIGraphicsImageRenderer(size: CGSize(width: 512, height: 512), format: f).image { ctx in
+                      let c = ctx.cgContext
+                      c.saveGState()
+                      if shape == .free {
+                          if lasso.count > 2 {
+                              let path = CGMutablePath()
+                              path.move(to: CGPoint(x: lasso[0].x * k, y: lasso[0].y * k))
+                              for pt in lasso.dropFirst() { path.addLine(to: CGPoint(x: pt.x * k, y: pt.y * k)) }
+                              path.closeSubpath()
+                              c.addPath(path)
+                              c.clip()
+                          }
+                      } else {
+                          let r = shape.rect(S)
+                          c.clip(to: CGRect(x: r.minX * k, y: r.minY * k, width: r.width * k, height: r.height * k))
+                      }
+                      c.translateBy(x: 256 + offset.width * k, y: 256 + offset.height * k)
+                      c.scaleBy(x: scale, y: scale)
+                      let s = min(512 / src.size.width, 512 / src.size.height)
+                      let w = src.size.width * s, h = src.size.height * s
+                      src.draw(in: CGRect(x: -w / 2, y: -h / 2, width: w, height: h))
+                      c.restoreGState()
+                      if !text.isEmpty {
+                          let font = UIFont.systemFont(ofSize: textSize * k, weight: .heavy)
+                          let attrs: [NSAttributedString.Key: Any] = [
+                              .font: font,
+                              .foregroundColor: UIColor(textColor),
+                              .strokeColor: UIColor.black,
+                              .strokeWidth: -6
+                          ]
+                          let str = NSAttributedString(string: text, attributes: attrs)
+                          let sz = str.size()
+                          str.draw(at: CGPoint(x: textPos.x * 512 - sz.width / 2, y: textPos.y * 512 - sz.height / 2))
+                      }
+                  }
+              }
+          }
+
+          struct CropDim: Shape {
+              var shape: CropShape
+              var S: CGFloat
+              var lasso: [CGPoint]
+              func path(in rect: CGRect) -> Path {
+                  var p = Path()
+                  p.addRect(rect)
+                  if shape == .free {
+                      guard lasso.count > 2 else { return Path() }
+                      p.move(to: lasso[0])
+                      for pt in lasso.dropFirst() { p.addLine(to: pt) }
+                      p.closeSubpath()
+                  } else {
+                      p.addRect(shape.rect(S))
+                  }
+                  return p
+              }
+          }
+
+          struct EditCanvas: View {
+              let image: UIImage
+              @Binding var p: EditParams
+              var drawing: Bool
+              @GestureState private var pinch: CGFloat = 1
+              @GestureState private var drag: CGSize = .zero
+              @State private var isDrawing = false
+
+              var body: some View {
+                  let S = p.S
+                  let move = DragGesture()
+                      .updating($drag) { v, s, _ in s = v.translation }
+                      .onEnded { v in
+                          p.offset = CGSize(width: p.offset.width + v.translation.width,
+                                            height: p.offset.height + v.translation.height)
+                      }
+                  let zoom = MagnificationGesture()
+                      .updating($pinch) { v, s, _ in s = v }
+                      .onEnded { v in p.scale = min(8, max(0.2, p.scale * v)) }
+                  ZStack {
+                      Rectangle().fill(Color.gray.opacity(0.18))
+                      Image(uiImage: image).resizable().scaledToFit().frame(width: S, height: S)
+                          .scaleEffect(p.scale * pinch)
+                          .offset(x: p.offset.width + drag.width, y: p.offset.height + drag.height)
+                      CropDim(shape: p.shape, S: S, lasso: p.lasso)
+                          .fill(Color.black.opacity(0.55), style: FillStyle(eoFill: true))
+                          .allowsHitTesting(false)
+                      outline
+                      if !p.text.isEmpty { textView(S) }
+                      if drawing { Color.clear.contentShape(Rectangle()).gesture(lassoGesture) }
+                  }
+                  .frame(width: S, height: S)
+                  .clipped()
+                  .coordinateSpace(name: "canvas")
+                  .gesture(move.simultaneously(with: zoom), including: drawing ? .none : .all)
+              }
+
+              @ViewBuilder private var outline: some View {
+                  if p.shape == .free {
+                      Path { path in
+                          if let f = p.lasso.first {
+                              path.move(to: f)
+                              for pt in p.lasso.dropFirst() { path.addLine(to: pt) }
+                              if p.lasso.count > 2 { path.closeSubpath() }
+                          }
+                      }
+                      .stroke(Color.white, style: StrokeStyle(lineWidth: 2, dash: [6, 4]))
+                      .allowsHitTesting(false)
+                  } else {
+                      Path(p.shape.rect(p.S)).stroke(Color.white.opacity(0.9), lineWidth: 1.5).allowsHitTesting(false)
+                  }
+              }
+
+              private var lassoGesture: some Gesture {
+                  DragGesture(minimumDistance: 0, coordinateSpace: .named("canvas"))
+                      .onChanged { v in
+                          if !isDrawing { isDrawing = true; p.lasso = [] }
+                          if let l = p.lasso.last, hypot(l.x - v.location.x, l.y - v.location.y) < 4 { return }
+                          p.lasso.append(v.location)
+                      }
+                      .onEnded { _ in isDrawing = false }
+              }
+
+              private func textView(_ S: CGFloat) -> some View {
+                  Text(p.text)
+                      .font(.system(size: p.textSize, weight: .heavy))
+                      .foregroundColor(p.textColor)
+                      .shadow(color: .black, radius: 1)
+                      .shadow(color: .black, radius: 1)
+                      .fixedSize()
+                      .gesture(
+                          DragGesture(coordinateSpace: .named("canvas")).onChanged { v in
+                              p.textPos = CGPoint(x: min(1, max(0, v.location.x / S)),
+                                                  y: min(1, max(0, v.location.y / S)))
+                          }
+                      )
+                      .position(x: p.textPos.x * S, y: p.textPos.y * S)
+              }
+          }
+
+          struct AnimView: UIViewRepresentable {
+              let data: Data
+              func makeUIView(context: Context) -> SDAnimatedImageView {
+                  let v = SDAnimatedImageView()
+                  v.contentMode = .scaleAspectFit
+                  v.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+                  v.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+                  v.image = SDAnimatedImage(data: data)
+                  return v
+              }
+              func updateUIView(_ v: SDAnimatedImageView, context: Context) {}
+          }
+
+          struct EmojiGrid: View {
+              @Binding var selection: [String]
+              static let all: [String] = ["❤️"] + Array("😀😁😂🤣😊😍🥰😘😎🤩🥳😜🤪😏😴🤔🙄😮😢😭😡🤯😱🥶🤢🤡👻💀👽🤖🎃👍👎👏🙌🙏💪👀🧡💛💚💙💜🖤💔🔥✨🌟💯🎉🎂🍕🍔🍟🍺🎮🚗🐶🐱🐼🦁🐸🙈").map { String($0) }
+
+              var body: some View {
+                  VStack(alignment: .leading, spacing: 6) {
+                      Text(tr("اختر إيموجي (حتى 3)", "Pick emojis (up to 3)")).font(.footnote).foregroundStyle(.secondary)
+                      LazyVGrid(columns: [GridItem(.adaptive(minimum: 44))], spacing: 6) {
+                          ForEach(EmojiGrid.all, id: \.self) { e in
+                              Button {
+                                  if let i = selection.firstIndex(of: e) { selection.remove(at: i) }
+                                  else if selection.count < 3 { selection.append(e) }
+                              } label: {
+                                  Text(e).font(.system(size: 28)).frame(width: 44, height: 44)
+                                      .background(selection.contains(e) ? Color.accentColor.opacity(0.3) : Color.clear,
+                                                  in: RoundedRectangle(cornerRadius: 10))
+                              }.buttonStyle(.plain)
+                          }
+                      }
+                  }
+              }
+          }
+
+          struct EmojiSheet: View {
+              @Binding var selection: [String]
+              let data: Data?
+              var onSave: () -> Void
+              var body: some View {
+                  NavigationStack {
+                      ScrollView {
+                          VStack(spacing: 16) {
+                              if let data { AnimView(data: data).frame(width: 160, height: 160) }
+                              EmojiGrid(selection: $selection)
+                          }.padding()
+                      }
+                      .navigationTitle(tr("الإيموجي", "Emoji"))
+                      .navigationBarTitleDisplayMode(.inline)
+                      .toolbar {
+                          ToolbarItem(placement: .topBarTrailing) {
+                              Button(tr("حفظ", "Save"), action: onSave).disabled(selection.isEmpty)
+                          }
+                      }
+                  }
+              }
+          }
+
+          struct StickerEditor: View {
+              let packID: String
+              let animatedPack: Bool
+              let source: Source
+              @EnvironmentObject var lib: Library
+              @Environment(\.dismiss) private var dismiss
+              @AppStorage("fps") private var fps = 15
+
+              @State private var original: UIImage?
+              @State private var working: UIImage?
+              @State private var p = EditParams(S: min(UIScreen.main.bounds.width - 32, 400))
+              @State private var removeBG = false
+              @State private var effect: Effect = .bounce
+              @State private var drawing = false
+              @State private var vidDur = 0.0
+              @State private var start = 0.0
+              @State private var length = 3.0
+              @State private var busy = false
+              @State private var error: String?
+              @State private var pendingData: Data?
+              @State private var emojis: [String] = ["😀"]
+              @State private var showEmoji = false
+
+              private var isImage: Bool { if case .image = source { return true }; return false }
+              private var isVideo: Bool { if case .video = source { return true }; return false }
+
+              var body: some View {
+                  NavigationStack {
+                      ScrollView {
+                          VStack(spacing: 14) {
+                              canvas
+                              shapeChips
+                              if p.shape == .free { lassoControls }
+                              zoomRow
+                              textRow
+                              if isImage { Toggle(tr("حذف الخلفية بالذكاء الاصطناعي (iOS 17+)", "Remove background with AI (iOS 17+)"), isOn: $removeBG) }
+                              if isImage && animatedPack { effectRow }
+                              if isVideo && vidDur > 0 { videoRow }
+                              if let error { Text(error).foregroundStyle(.red).font(.footnote) }
+                          }.padding()
+                      }
+                      .navigationTitle(tr("تعديل الستيكر", "Edit sticker"))
+                      .navigationBarTitleDisplayMode(.inline)
+                      .toolbar {
+                          ToolbarItem(placement: .topBarLeading) {
+                              Button(tr("إلغاء", "Cancel")) { dismiss() }
+                          }
+                          ToolbarItem(placement: .topBarTrailing) {
+                              if busy { ProgressView() }
+                              else { Button(tr("التالي", "Next"), action: export).disabled(working == nil) }
+                          }
+                      }
+                      .task { await prepare() }
+                      .onChange(of: removeBG) { on in toggleBG(on) }
+                      .sheet(isPresented: $showEmoji) {
+                          EmojiSheet(selection: $emojis, data: pendingData) {
+                              if let d = pendingData { lib.addSticker(packID, data: d, emojis: emojis) }
+                              showEmoji = false
+                              dismiss()
+                          }
+                      }
+                  }
+              }
+
+              private var canvas: some View {
+                  Group {
+                      if let w = working {
+                          EditCanvas(image: w, p: $p, drawing: drawing && p.shape == .free)
+                      } else {
+                          ProgressView().frame(width: p.S, height: p.S)
+                      }
+                  }
+              }
+
+              private var shapeChips: some View {
+                  ScrollView(.horizontal, showsIndicators: false) {
+                      HStack {
+                          ForEach(CropShape.allCases) { s in
+                              Button {
+                                  p.shape = s
+                                  if s != .free { drawing = false }
+                              } label: {
+                                  Text(s.title).padding(.horizontal, 14).padding(.vertical, 8)
+                                      .background(p.shape == s ? Color.accentColor : Color.gray.opacity(0.2), in: Capsule())
+                                      .foregroundStyle(p.shape == s ? Color.white : Color.primary)
+                              }
+                          }
+                      }
+                  }
+              }
+
+              private var lassoControls: some View {
+                  HStack {
+                      Toggle(tr("ارسم حدود القص بإصبعك", "Draw the cut outline"), isOn: $drawing)
+                      Button(tr("مسح", "Clear")) { p.lasso = [] }
+                  }
+              }
+
+              private var zoomRow: some View {
+                  HStack {
+                      Image(systemName: "minus.magnifyingglass")
+                      Slider(value: $p.scale, in: 0.2...5)
+                      Image(systemName: "plus.magnifyingglass")
+                      Button { p.scale = 1; p.offset = .zero } label: { Image(systemName: "arrow.counterclockwise") }
+                  }
+              }
+
+              private var textRow: some View {
+                  VStack(spacing: 8) {
+                      TextField(tr("أضف نص على الستيكر", "Add text to sticker"), text: $p.text).textFieldStyle(.roundedBorder)
+                      if !p.text.isEmpty {
+                          HStack {
+                              ColorPicker("", selection: $p.textColor).labelsHidden()
+                              Slider(value: $p.textSize, in: 24...120)
+                          }
+                          Text(tr("اسحب النص على الصورة لتحريكه", "Drag the text on the image to move it"))
+                              .font(.caption).foregroundStyle(.secondary)
+                      }
+                  }
+              }
+
+              private var effectRow: some View {
+                  HStack {
+                      Text(tr("تأثير الحركة", "Motion effect"))
+                      Spacer()
+                      Picker("", selection: $effect) {
+                          ForEach(Effect.allCases) { Text($0.title).tag($0) }
+                      }.pickerStyle(.menu)
+                  }
+              }
+
+              private var videoRow: some View {
+                  VStack(spacing: 8) {
+                      HStack {
+                          Text(tr("البداية", "Start")).frame(width: 60, alignment: .leading)
+                          Slider(value: $start, in: 0...max(0.1, vidDur - 0.3), onEditingChanged: { e in
+                              if !e { Task { await loadPreview() } }
+                          })
+                          Text(String(format: "%.1fs", start)).font(.caption).frame(width: 44)
+                      }
+                      HStack {
+                          Text(tr("المدة", "Length")).frame(width: 60, alignment: .leading)
+                          Slider(value: $length, in: 0.3...max(0.4, min(8, vidDur)))
+                          Text(String(format: "%.1fs", length)).font(.caption).frame(width: 44)
+                      }
+                      Picker("FPS", selection: $fps) {
+                          ForEach([10, 15, 20, 24], id: \.self) { Text("\($0) fps").tag($0) }
+                      }.pickerStyle(.segmented)
+                  }
+              }
+
+              private func prepare() async {
+                  switch source {
+                  case .image(let ui):
+                      original = ui; working = ui
+                  case .gif(let fr, _):
+                      original = fr.first; working = fr.first
+                  case .video(let url):
+                      let d = (try? await AVURLAsset(url: url).load(.duration)).map { CMTimeGetSeconds($0) } ?? 0
+                      vidDur = d.isFinite ? d : 0
+                      length = min(6, max(0.5, vidDur))
+                      await loadPreview()
+                  }
+              }
+
+              private func loadPreview() async {
+                  guard case .video(let url) = source else { return }
+                  let t = start
+                  let img = await Task.detached { Imaging.videoFrame(url: url, at: t) }.value
+                  original = img
+                  working = img
+              }
+
+              private func toggleBG(_ on: Bool) {
+                  guard let o = original else { return }
+                  if !on { working = o; return }
+                  busy = true; error = nil
+                  Task.detached(priority: .userInitiated) {
+                      let m = Imaging.removeBackground(o)
+                      await MainActor.run {
+                          busy = false
+                          if let m { working = m }
+                          else { error = tr("حذف الخلفية يحتاج iOS 17 وما لقى عنصر واضح", "Background removal needs iOS 17 and a clear subject") }
+                      }
+                  }
+              }
+
+              private func export() {
+                  guard !busy else { return }
+                  let params = p
+                  busy = true; error = nil
+                  let src = source
+                  let w = working
+                  let eff = effect
+                  let animated = animatedPack
+                  let fpsV = Double(fps)
+                  let st = start
+                  let len = min(length, max(0.5, vidDur - start))
+                  Task.detached(priority: .userInitiated) {
+                      var frames: [UIImage] = []
+                      var durs: [Double] = []
+                      switch src {
+                      case .image:
+                          if let w {
+                              let base = params.render(w)
+                              if animated {
+                                  frames = eff.frames(base)
+                                  durs = Array(repeating: 0.05, count: frames.count)
+                              } else {
+                                  frames = [base]; durs = [0.1]
+                              }
+                          }
+                      case .gif(let fr, let d):
+                          frames = fr.map { params.render($0) }
+                          durs = d
+                      case .video(let url):
+                          let raw = Imaging.videoFrames(url: url, start: st, length: len, fps: fpsV)
+                          frames = raw.map { params.render($0) }
+                          durs = Array(repeating: 1.0 / fpsV, count: frames.count)
+                      }
+                      let data = frames.isEmpty ? nil : Imaging.encode(frames: frames, durations: durs)
+                      await MainActor.run {
+                          busy = false
+                          if let data { pendingData = data; showEmoji = true }
+                          else { error = tr("تعذر ضغط الستيكر للحجم المطلوب، جرّب مدة أقصر", "Could not compress to the required size, try a shorter clip") }
+                      }
+                  }
+              }
+          }
+          EOF_FILE
+          cat > Sources/Views.swift <<'EOF_FILE'
+          import SwiftUI
+          import PhotosUI
+
+          struct HomeView: View {
+              @EnvironmentObject var lib: Library
+              @State private var showNew = false
+              @State private var showSettings = false
+              @State private var path: [String] = []
+
+              var body: some View {
+                  NavigationStack(path: $path) {
+                      Group {
+                          if lib.packs.isEmpty { emptyState } else { list }
+                      }
+                      .navigationTitle("Stickify")
+                      .navigationDestination(for: String.self) { id in PackView(packID: id) }
+                      .toolbar {
+                          ToolbarItem(placement: .topBarLeading) {
+                              Button { showSettings = true } label: { Image(systemName: "gearshape") }
+                          }
+                          ToolbarItem(placement: .topBarTrailing) {
+                              Button { showNew = true } label: { Image(systemName: "plus.circle.fill").font(.title2) }
+                          }
+                      }
+                      .sheet(isPresented: $showNew) { NewPackSheet { id in path.append(id) } }
+                      .sheet(isPresented: $showSettings) { SettingsView() }
+                  }
+              }
+
+              private var emptyState: some View {
+                  VStack(spacing: 14) {
+                      Image(systemName: "face.smiling").font(.system(size: 64)).foregroundStyle(.tint)
+                      Text(tr("ما عندك حزم ستيكرات بعد", "No sticker packs yet")).font(.title3.bold())
+                      Text(tr("اضغط + بالزاوية لإنشاء أول حزمة", "Tap + in the corner to create your first pack"))
+                          .foregroundStyle(.secondary)
+                  }.padding()
+              }
+
+              private var list: some View {
+                  List {
+                      ForEach(lib.packs) { pack in
+                          NavigationLink(value: pack.id) { PackRow(pack: pack) }
+                      }
+                      .onDelete { offsets in
+                          let ids = offsets.map { lib.packs[$0].id }
+                          for id in ids { lib.deletePack(id) }
+                      }
+                  }
+              }
+          }
+
+          struct PackRow: View {
+              @EnvironmentObject var lib: Library
+              let pack: PackMeta
+              var body: some View {
+                  HStack(spacing: 12) {
+                      ZStack {
+                          RoundedRectangle(cornerRadius: 12).fill(Color.gray.opacity(0.15))
+                          if let f = pack.stickers.first {
+                              Image(uiImage: lib.thumb(f.id)).resizable().scaledToFit().padding(6)
+                          } else {
+                              Image(systemName: "face.smiling").foregroundStyle(.secondary)
+                          }
+                      }.frame(width: 56, height: 56)
+                      VStack(alignment: .leading, spacing: 4) {
+                          Text(pack.name).font(.headline)
+                          Text("\(pack.stickers.count)/30 · " + (pack.animated ? tr("متحركة", "Animated") : tr("صور", "Images")))
+                              .font(.caption).foregroundStyle(.secondary)
+                      }
+                  }
+              }
+          }
+
+          struct NewPackSheet: View {
+              @EnvironmentObject var lib: Library
+              @Environment(\.dismiss) private var dismiss
+              @AppStorage("publisher") private var defaultPublisher = ""
+              @State private var animated = false
+              @State private var name = ""
+              @State private var publisher = ""
+              var onCreate: (String) -> Void
+
+              var body: some View {
+                  NavigationStack {
+                      Form {
+                          Section(tr("نوع الحزمة", "Pack type")) {
+                              typeRow(false, "photo", tr("صور", "Images"), tr("قص وتكبير وإضافة نص", "Crop, zoom and add text"))
+                              typeRow(true, "film", tr("متحركة (فيديو أو GIF)", "Animated (video or GIF)"), tr("تحويل فيديو أو GIF لستيكر", "Turn a video or GIF into a sticker"))
+                          }
+                          Section {
+                              TextField(tr("اسم الحزمة", "Pack name"), text: $name)
+                              TextField(tr("الناشر", "Publisher"), text: $publisher)
+                          }
+                      }
+                      .navigationTitle(tr("حزمة جديدة", "New pack"))
+                      .navigationBarTitleDisplayMode(.inline)
+                      .onAppear { publisher = defaultPublisher }
+                      .toolbar {
+                          ToolbarItem(placement: .topBarLeading) { Button(tr("إلغاء", "Cancel")) { dismiss() } }
+                          ToolbarItem(placement: .topBarTrailing) {
+                              Button(tr("إنشاء", "Create")) {
+                                  let n = name.trimmingCharacters(in: .whitespaces)
+                                  let pub = publisher.trimmingCharacters(in: .whitespaces)
+                                  let id = lib.addPack(name: n, publisher: pub.isEmpty ? "Stickify" : pub, animated: animated)
+                                  dismiss()
+                                  onCreate(id)
+                              }.disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
+                          }
+                      }
+                  }
+              }
+
+              private func typeRow(_ value: Bool, _ icon: String, _ title: String, _ sub: String) -> some View {
+                  Button { animated = value } label: {
+                      HStack(spacing: 12) {
+                          Image(systemName: icon).font(.title2).frame(width: 34)
+                          VStack(alignment: .leading, spacing: 2) {
+                              Text(title).font(.headline)
+                              Text(sub).font(.caption).foregroundStyle(.secondary)
+                          }
+                          Spacer()
+                          if animated == value { Image(systemName: "checkmark.circle.fill").foregroundStyle(.tint) }
+                      }
+                  }.buttonStyle(.plain)
+              }
+          }
+
+          struct PackView: View {
+              let packID: String
+              @EnvironmentObject var lib: Library
+              @State private var pick: PhotosPickerItem?
+              @State private var job: EditJob?
+              @State private var loading = false
+              @State private var message: String?
+              @State private var detail: StickerMeta?
+              @State private var showRename = false
+              @State private var newName = ""
+
+              private var pack: PackMeta? { lib.packs.first { $0.id == packID } }
+
+              var body: some View {
+                  Group {
+                      if let pack { content(pack) } else { Text("") }
+                  }
+              }
+
+              private func content(_ pack: PackMeta) -> some View {
+                  let filter: PHPickerFilter = pack.animated ? .any(of: [.videos, .images]) : .images
+                  return VStack(spacing: 10) {
+                      Text("\(pack.publisher) · \(pack.stickers.count)/30").font(.footnote).foregroundStyle(.secondary)
+                      ScrollView {
+                          if pack.stickers.isEmpty {
+                              Text(pack.animated
+                                   ? tr("اضغط + واختر فيديو أو GIF", "Tap + and pick a video or GIF")
+                                   : tr("اضغط + واختر صورة", "Tap + and pick a photo"))
+                                  .foregroundStyle(.secondary).padding(.top, 60)
+                          }
+                          LazyVGrid(columns: [GridItem(.adaptive(minimum: 88), spacing: 10)], spacing: 10) {
+                              ForEach(pack.stickers) { s in
+                                  Button { detail = s } label: {
+                                      Image(uiImage: lib.thumb(s.id)).resizable().scaledToFit().padding(6)
+                                          .background(Color.gray.opacity(0.15), in: RoundedRectangle(cornerRadius: 12))
+                                          .overlay(alignment: .bottomTrailing) {
+                                              Text(s.emojis.first ?? "").font(.caption).padding(3)
+                                          }
+                                  }.buttonStyle(.plain)
+                              }
+                          }.padding(.horizontal)
+                      }
+                      Button {
+                          message = WhatsApp.send(pack, lib: lib)
+                      } label: {
+                          Label(tr("إضافة إلى واتساب", "Add to WhatsApp"), systemImage: "paperplane.fill")
+                              .frame(maxWidth: .infinity).padding()
+                              .background(Color.green, in: RoundedRectangle(cornerRadius: 14))
+                              .foregroundStyle(.white)
+                      }.padding(.horizontal).padding(.bottom, 8)
+                  }
+                  .navigationTitle(pack.name)
+                  .navigationBarTitleDisplayMode(.inline)
+                  .toolbar {
+                      ToolbarItem(placement: .topBarTrailing) {
+                          HStack {
+                              Menu {
+                                  Button(tr("إعادة تسمية", "Rename")) { newName = pack.name; showRename = true }
+                              } label: { Image(systemName: "ellipsis.circle") }
+                              PhotosPicker(selection: $pick, matching: filter) {
+                                  Image(systemName: "plus.circle.fill").font(.title2)
+                              }.disabled(pack.stickers.count >= 30)
+                          }
+                      }
+                  }
+                  .overlay { if loading { ProgressView().padding(24).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14)) } }
+                  .onChange(of: pick) { _ in Task { await loadPick(pack.animated) } }
+                  .fullScreenCover(item: $job) { j in
+                      StickerEditor(packID: packID, animatedPack: pack.animated, source: j.source)
+                  }
+                  .sheet(item: $detail) { s in StickerDetail(packID: packID, sticker: s) }
+                  .alert(tr("إعادة تسمية", "Rename"), isPresented: $showRename) {
+                      TextField(tr("اسم الحزمة", "Pack name"), text: $newName)
+                      Button(tr("حفظ", "Save")) {
+                          let n = newName.trimmingCharacters(in: .whitespaces)
+                          if !n.isEmpty { lib.rename(packID, name: n) }
+                      }
+                      Button(tr("إلغاء", "Cancel"), role: .cancel) {}
+                  }
+                  .alert(tr("تنبيه", "Notice"), isPresented: Binding(get: { message != nil }, set: { if !$0 { message = nil } })) {
+                      Button("OK", role: .cancel) {}
+                  } message: { Text(message ?? "") }
+              }
+
+              @MainActor
+              private func loadPick(_ animated: Bool) async {
+                  guard let item = pick else { return }
+                  loading = true
+                  if animated, let m = try? await item.loadTransferable(type: Movie.self) {
+                      job = EditJob(source: .video(m.url))
+                  } else if let d = try? await item.loadTransferable(type: Data.self) {
+                      if animated, let g = Imaging.gifFrames(d) {
+                          job = EditJob(source: .gif(g.frames, g.delays))
+                      } else if let ui = UIImage(data: d) {
+                          job = EditJob(source: .image(Imaging.normalize(ui)))
+                      }
+                  }
+                  loading = false
+                  pick = nil
+              }
+          }
+
+          struct StickerDetail: View {
+              let packID: String
+              let sticker: StickerMeta
+              @EnvironmentObject var lib: Library
+              @Environment(\.dismiss) private var dismiss
+              @State private var emojis: [String] = []
+
+              var body: some View {
+                  NavigationStack {
+                      ScrollView {
+                          VStack(spacing: 16) {
+                              if let d = lib.data(sticker.id) { AnimView(data: d).frame(width: 200, height: 200) }
+                              EmojiGrid(selection: $emojis)
+                              Button(role: .destructive) {
+                                  lib.deleteSticker(packID, sticker.id)
+                                  dismiss()
+                              } label: { Label(tr("حذف الستيكر", "Delete sticker"), systemImage: "trash") }
+                          }.padding()
+                      }
+                      .navigationTitle(tr("ستيكر", "Sticker"))
+                      .navigationBarTitleDisplayMode(.inline)
+                      .onAppear { emojis = sticker.emojis }
+                      .toolbar {
+                          ToolbarItem(placement: .topBarTrailing) {
+                              Button(tr("تم", "Done")) {
+                                  if !emojis.isEmpty { lib.setEmojis(packID, sticker.id, emojis) }
+                                  dismiss()
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+
+          struct SettingsView: View {
+              @Environment(\.dismiss) private var dismiss
+              @AppStorage("lang") private var lang = "ar"
+              @AppStorage("theme") private var theme = 0
+              @AppStorage("accent") private var accent = 0
+              @AppStorage("publisher") private var publisher = ""
+              @AppStorage("fps") private var fps = 15
+
+              var body: some View {
+                  NavigationStack {
+                      Form {
+                          Section(tr("اللغة", "Language")) {
+                              Picker("", selection: $lang) {
+                                  Text("العربية").tag("ar")
+                                  Text("English").tag("en")
+                              }.pickerStyle(.segmented)
+                          }
+                          Section(tr("المظهر", "Appearance")) {
+                              Picker("", selection: $theme) {
+                                  Text(tr("تلقائي", "System")).tag(0)
+                                  Text(tr("فاتح", "Light")).tag(1)
+                                  Text(tr("داكن", "Dark")).tag(2)
+                              }.pickerStyle(.segmented)
+                              HStack(spacing: 14) {
+                                  Text(tr("لون التطبيق", "Accent color"))
+                                  Spacer()
+                                  ForEach(0..<Palette.colors.count, id: \.self) { i in
+                                      Circle().fill(Palette.colors[i]).frame(width: 28, height: 28)
+                                          .overlay(Circle().stroke(Color.primary, lineWidth: accent == i ? 3 : 0))
+                                          .onTapGesture { accent = i }
+                                  }
+                              }
+                          }
+                          Section(tr("افتراضيات", "Defaults")) {
+                              TextField(tr("اسم الناشر الافتراضي", "Default publisher name"), text: $publisher)
+                              Picker(tr("إطارات الفيديو بالثانية", "Video frames per second"), selection: $fps) {
+                                  ForEach([10, 15, 20, 24], id: \.self) { Text("\($0)").tag($0) }
+                              }
+                          }
+                          Section(tr("حول", "About")) {
+                              HStack { Text(tr("الإصدار", "Version")); Spacer(); Text("1.1").foregroundStyle(.secondary) }
+                          }
+                      }
+                      .navigationTitle(tr("الإعدادات", "Settings"))
+                      .navigationBarTitleDisplayMode(.inline)
+                      .toolbar {
+                          ToolbarItem(placement: .topBarTrailing) { Button(tr("تم", "Done")) { dismiss() } }
+                      }
+                  }
+              }
+          }
+          EOF_FILE
+          cat > Sources/Assets.xcassets/Contents.json <<'EOF_FILE'
+          {"info":{"author":"xcode","version":1}}
+          EOF_FILE
+          cat > Sources/Assets.xcassets/AppIcon.appiconset/Contents.json <<'EOF_FILE'
+          {"images":[{"filename":"icon.png","idiom":"universal","platform":"ios","size":"1024x1024"}],"info":{"author":"xcode","version":1}}
+          EOF_FILE
+      - name: Generate app icon
+        run: swift tools/icon.swift Sources/Assets.xcassets/AppIcon.appiconset/icon.png || echo "icon failed"
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate project
+        run: xcodegen generate
+      - name: Build unsigned
+        run: |
+          xcodebuild -project Stickify.xcodeproj -scheme Stickify -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
+      - name: Package IPA
+        run: |
+          mkdir Payload
+          cp -R build/Build/Products/Release-iphoneos/Stickify.app Payload/
+          zip -qry Stickify.ipa Payload
+      - uses: actions/upload-artifact@v4
         with:
-          name: Stickify-IPA
-          path: Stickify-Unsigned.ipa
+          name: Stickify-ipa
+          path: Stickify.ipa
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Stickify build ${{ github.run_number }}
+          files: Stickify.ipa
