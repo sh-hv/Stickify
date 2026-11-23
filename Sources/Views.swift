@@ -1,10 +1,6 @@
 import SwiftUI
 import PhotosUI
 
-enum Links {
-    static let github = "https://github.com/sh-hv/Stickify"
-}
-
 struct AnimCell: View {
     let sid: String
     @EnvironmentObject var lib: Library
@@ -418,9 +414,8 @@ struct SettingsView: View {
     }
 
     private var linksSection: some View {
-        Section(tr("روابط", "Links")) {
+        Section(tr("حسابي", "Follow me")) {
             linkRow(logo: "XLogo", title: "Spidey", url: "https://x.com/sh_hhv")
-            linkRow(logo: "GitHubLogo", title: tr("المشروع المجاني", "Free project"), url: Links.github)
         }
     }
 
