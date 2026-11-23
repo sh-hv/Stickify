@@ -32,8 +32,8 @@ The IPA is unsigned; signing happens at install time.
 
 ## التخصيص | Customization
 
-- `icon.png` في جذر المشروع: أيقونة التطبيق (1024×1024، بدون شفافية) | in the repo root: the app icon (1024×1024, opaque)
-- `x-logo.png` و`github-logo.png` في جذر المشروع: لوغوات قسم الروابط (PNG شفاف بلون واحد) | in the repo root: logos for the links section (single-color transparent PNG)
+- `Sources/stickify.icon`: أيقونة التطبيق (Icon Composer) | the app icon (Icon Composer)
+- `Sources/Assets.xcassets/XLogo.imageset`: لوغو X | X logo
 
 ## البنية | Structure
 
@@ -41,7 +41,6 @@ The IPA is unsigned; signing happens at install time.
 .github/workflows/build.yml   خطوات البناء | build steps
 project.yml                   إعدادات المشروع | project config
 Sources/                      كود التطبيق | app source
-tools/icon.swift              مولّد الأيقونة الافتراضية | default icon generator
 ```
 
 ## المتطلبات | Requirements
